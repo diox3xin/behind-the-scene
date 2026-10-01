@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
     MODULE_NAME, normalizeSettings, createSession, getStore, participantFromCard,
     buildRequest, requestInterview, generateTurn, StaleInterviewError,
+    collectSceneParticipants, mergeParticipants, parseDetectedParticipants, buildDetectionRequest,
 } from '../interview-core.mjs';
 
 function fixture() {
@@ -14,6 +15,36 @@ function fixture() {
     ];
     return session;
 }
+
+test('scene suggestions include persona, mentioned cards and speakers without unrelated cards', () => {
+    const session = fixture();
+    session.scene = 'Тайлер посмотрел на Еву. Ева улыбнулась.';
+    const context = {
+        chat: [{ name: 'Тайлер', mes: session.scene }], name1: 'Ева',
+        powerUserSettings: { persona_description: 'Персона пользователя' },
+        characters: [{ name: 'Тайлер' }, { name: 'Ева' }, { name: 'Неизвестный' }],
+    };
+    const participants = collectSceneParticipants(context, session);
+    assert.deepEqual(participants.map(p => p.name), ['Ева', 'Тайлер']);
+    assert.equal(participants[0].kind, 'persona');
+    assert.equal(participants[0].description, 'Персона пользователя');
+});
+
+test('detection JSON is validated, duplicates preserve manual selection and descriptions', () => {
+    const session = fixture();
+    session.participants[0].selected = false;
+    const data = parseDetectedParticipants('```json\n[{"name":" тайлер ","description":"Другой"},{"name":"Официант"},null,{}]\n```');
+    mergeParticipants(session, data);
+    assert.equal(session.participants.length, 4);
+    assert.equal(session.participants[0].selected, false);
+    assert.equal(session.participants[0].description, 'Ироничный');
+    assert.equal(session.participants.at(-1).name, 'Официант');
+    assert.throws(() => parseDetectedParticipants('не JSON'));
+    assert.throws(() => parseDetectedParticipants('{}'));
+    session.includeContext = false;
+    session.context = 'Скрытый контекст';
+    assert.doesNotMatch(JSON.stringify(buildDetectionRequest(session)), /Скрытый контекст/);
+});
 
 test('defaults fill partial old settings and clamp response limit', () => {
     assert.equal(normalizeSettings({ enabled: false }).responseLength, 240);

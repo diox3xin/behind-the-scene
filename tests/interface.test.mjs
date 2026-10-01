@@ -45,7 +45,7 @@ class Node {
 
 async function flush() { await new Promise(resolve => setImmediate(resolve)); }
 
-function setup() {
+function setup(options = {}) {
     const body = new Node('body');
     const settings = new Node('div');
     settings.id = 'extensions_settings2';
@@ -61,16 +61,22 @@ function setup() {
     const state = { calls: 0, saves: 0 };
     let context = {
         chatId: 'first', characterId: 0, groupId: null,
-        chatMetadata: {}, extensionSettings: {},
+        chatMetadata: {}, extensionSettings: { [core.MODULE_NAME]: { autoDetect: false } },
         chat: [{ name: 'Тайлер', mes: '<img src=x onerror=alert(1)>Сцена', is_user: false }],
         characters: [{ name: 'Тайлер', avatar: 'tyler.png', data: { description: 'Ироничный' } }],
         saveMetadata: async () => { state.saves++; }, saveSettingsDebounced() {},
         generateRaw: async () => { state.calls++; return 'Тайлер: *фыркнул* «Интенсивно». <script>alert(1)</script>'; },
-        eventTypes: Object.fromEntries(['CHAT_CHANGED', 'GENERATION_STARTED', 'GENERATION_ENDED'].map(name => [name, name])),
+        eventTypes: Object.fromEntries(['CHAT_CHANGED', 'GENERATION_STARTED', 'GENERATION_ENDED', 'GENERATION_STOPPED'].map(name => [name, name])),
         eventSource: { on(name, listener) { events[name] = listener; } },
     };
     const document = {
-        body, createElement: tag => new Node(tag),
+        body, createElement: tag => {
+            const node = new Node(tag);
+            if (tag === 'dialog' && options.noDialog) node.showModal = undefined;
+            if (tag === 'dialog' && options.brokenDialog) node.showModal = () => { throw new Error('Unsupported'); };
+            return node;
+        },
+        addEventListener() {}, removeEventListener() {},
         createTextNode: text => Object.assign(new Node('#text'), { textContent: text }),
         getElementById: id => body.all().find(node => node.id === id),
         querySelectorAll: selector => body.querySelectorAll(selector),
@@ -112,6 +118,95 @@ test('entry point opens mini-chat without generating, restores persisted history
     await app.byText('Открыть').fire('click');
     assert.equal(app.body.querySelectorAll('.bts-bubble').length, 2);
     assert.ok(app.state.saves >= 2);
+});
+
+test('dryRun does not block interview; real generation blocks until stopped', async () => {
+    const app = setup();
+    const dialog = await app.open();
+    app.events.GENERATION_STARTED('normal', {}, true);
+    dialog.querySelector('.bts-question').value = 'После dryRun';
+    await app.byText('Спросить').fire('click');
+    await flush();
+    assert.equal(app.state.calls, 1);
+    app.events.GENERATION_STARTED('normal', {}, false);
+    app.events.GENERATION_STARTED('normal', {}, true);
+    dialog.querySelector('.bts-question').value = 'Во время генерации';
+    await app.byText('Спросить').fire('click');
+    await flush();
+    assert.equal(app.state.calls, 1);
+    app.events.GENERATION_STOPPED();
+    await app.byText('Спросить').fire('click');
+    await flush();
+    assert.equal(app.state.calls, 2);
+});
+
+test('mobile fallback opens and closes without native showModal or when it throws', async () => {
+    for (const options of [{ noDialog: true }, { brokenDialog: true }]) {
+        const app = setup(options);
+        const dialog = await app.open();
+        assert.equal(dialog.getAttribute('open'), '');
+        assert.equal(dialog.getAttribute('aria-modal'), 'true');
+        assert.ok(app.body.querySelector('.bts-backdrop'));
+        await app.byText('Закрыть').fire('click');
+        assert.equal(app.body.querySelector('dialog'), null);
+        assert.equal(app.body.querySelector('.bts-backdrop'), null);
+        assert.deepEqual(app.errors, []);
+    }
+});
+
+test('window opens immediately even if character loading never resolves', async () => {
+    const app = setup();
+    app.context().unshallowCharacter = () => new Promise(() => {});
+    const dialog = await app.open();
+    assert.ok(dialog.open);
+});
+
+test('automatic NPC detection merges participants and never posts to story or interview log', async () => {
+    const app = setup();
+    const toggle = app.document.getElementById('bts-panel').querySelectorAll('input')[1];
+    toggle.checked = true;
+    await toggle.fire('change');
+    app.context().name1 = 'Ева';
+    app.context().powerUserSettings = { persona_description: 'Актриса' };
+    app.context().generateRaw = async () => '[{"name":"Бармен","description":"Наливал напиток"},{"name":"Ева"}]';
+    await app.open();
+    await flush();
+    const session = core.getStore(app.context().chatMetadata).sessions[0];
+    assert.deepEqual(Array.from(session.participants, p => p.name), ['Ева', 'Тайлер', 'Бармен']);
+    assert.equal(session.participants[0].description, 'Актриса');
+    assert.equal(session.messages.length, 0);
+    assert.equal(app.context().chat.length, 1);
+});
+
+test('NPC detection failures leave interview usable and manual participants intact', async () => {
+    const app = setup();
+    const dialog = await app.open();
+    app.context().generateRaw = async () => 'not JSON';
+    await app.byText('Найти NPC в сцене').fire('click');
+    await flush();
+    assert.equal(app.byText('Спросить').disabled, false);
+    assert.equal(core.getStore(app.context().chatMetadata).sessions[0].participants.length, 1);
+    app.context().generateRaw = async () => 'Ответ';
+    dialog.querySelector('.bts-question').value = 'Вопрос';
+    await app.byText('Спросить').fire('click');
+    await flush();
+    assert.equal(core.getStore(app.context().chatMetadata).sessions[0].messages.length, 2);
+});
+
+test('late NPC detection after changing chats is discarded', async () => {
+    const app = setup();
+    await app.open();
+    const oldSession = core.getStore(app.context().chatMetadata).sessions[0];
+    let finish;
+    app.context().generateRaw = () => new Promise(resolve => { finish = resolve; });
+    await app.byText('Найти NPC в сцене').fire('click');
+    await flush();
+    app.switchChat();
+    finish('[{"name":"Поздний NPC"}]');
+    await flush();
+    assert.equal(oldSession.participants.length, 1);
+    assert.equal(core.getStore(app.context().chatMetadata).sessions.length, 0);
+    assert.deepEqual(app.errors, []);
 });
 
 test('quick questions fill draft without sending; NPC and selection reach the prompt', async () => {

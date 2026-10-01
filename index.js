@@ -2,6 +2,7 @@ import { getContext } from '../../../extensions.js';
 import {
     MODULE_NAME, QUICK_QUESTIONS, createId, normalizeSettings, createSession,
     getStore, participantFromCard, requestInterview, generateTurn, StaleInterviewError,
+    collectSceneParticipants, mergeParticipants, buildDetectionRequest, parseDetectedParticipants,
 } from './interview-core.mjs';
 
 let settings;
@@ -71,6 +72,9 @@ function closeInterview() {
     const view = activeWindow;
     activeWindow = null;
     view.controller?.abort();
+    view.viewportCleanup?.();
+    view.backdrop?.remove();
+    document.removeEventListener('keydown', view.keyHandler);
     view.dialog.close?.();
     view.dialog.removeAttribute('open');
     view.dialog.remove();
@@ -115,7 +119,8 @@ function renderParticipants(view) {
         check.type = 'checkbox';
         check.checked = participant.selected;
         check.addEventListener('change', () => { participant.selected = check.checked; remember(view); });
-        label.append(check, document.createTextNode(participant.name));
+        const source = { persona: 'персона', card: 'карточка', npc: 'NPC' }[participant.kind];
+        label.append(check, document.createTextNode(`${participant.name}${source ? ` (${source})` : ''}`));
         label.title = participant.description || 'Описание не задано';
         const remove = button('×', () => {
             view.session.participants = view.session.participants.filter(p => p.id !== participant.id);
@@ -145,6 +150,99 @@ function labeled(text, control) {
     const label = element('label', 'bts-field');
     label.append(element('span', '', text), control);
     return label;
+}
+
+async function detectParticipants(view) {
+    if (activeWindow !== view || !sameChat(view.snapshot) || view.busy) return;
+    if (requestInFlight || mainGenerating) {
+        view.detectionStatus.textContent = 'Распознавание отложено: идёт генерация. Нажмите «Найти NPC в сцене» после её окончания.';
+        return;
+    }
+    view.busy = true;
+    requestInFlight = true;
+    view.controls.disabled = true;
+    view.send.disabled = true;
+    view.controller = new AbortController();
+    view.detectionStatus.textContent = 'Ищу участников и NPC в тексте сцены…';
+    try {
+        const text = await requestInterview(getContext(), view.session.profileId, buildDetectionRequest(view.session), view.controller.signal);
+        if (activeWindow !== view || !sameChat(view.snapshot)) return;
+        mergeParticipants(view.session, parseDetectedParticipants(text));
+        renderParticipants(view);
+        remember(view);
+        view.detectionStatus.textContent = 'Участники найдены. Проверьте галочки: модель может ошибаться.';
+    } catch (error) {
+        if (activeWindow === view && sameChat(view.snapshot)) {
+            view.detectionStatus.textContent = `Не удалось найти NPC: ${error.message} Можно повторить или добавить вручную.`;
+            console.warn('[Behind the Scene] Participant detection:', error);
+        }
+    } finally {
+        view.busy = false;
+        requestInFlight = false;
+        view.controls.disabled = false;
+        view.send.disabled = false;
+    }
+}
+
+async function hydrateParticipants(view) {
+    // Load shallow cards after showing the window, never before a mobile tap opens it.
+    for (const participant of view.session.participants) {
+        if (!participant.avatar) continue;
+        const id = Object.keys(getContext().characters || {}).find(key => getContext().characters[key]?.avatar === participant.avatar);
+        if (id === undefined) continue;
+        try {
+            await getContext().unshallowCharacter?.(id);
+            if (activeWindow !== view || !sameChat(view.snapshot)) return;
+            const card = getContext().characters[id];
+            if (card?.avatar === participant.avatar) participant.description = participantFromCard(card).description;
+        } catch (error) { console.warn('[Behind the Scene] Card details unavailable', error); }
+    }
+    if (activeWindow === view && sameChat(view.snapshot)) {
+        renderParticipants(view);
+        remember(view);
+    }
+}
+
+function showInterviewWindow(view) {
+    const dialog = view.dialog;
+    // Preserve native modality where supported; fall back to a fixed accessible overlay.
+    try {
+        if (typeof dialog.showModal !== 'function') throw new Error('Native dialog unavailable');
+        dialog.showModal();
+    } catch (error) {
+        console.info('[Behind the Scene] Using mobile dialog fallback:', error.message);
+        dialog.className += ' bts-dialog-fallback';
+        dialog.setAttribute('open', '');
+        dialog.setAttribute('role', 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
+        view.backdrop = element('div', 'bts-backdrop');
+        document.body.append(view.backdrop);
+    }
+    view.keyHandler = event => {
+        if (event.key === 'Escape') { event.preventDefault(); closeInterview(); }
+        if (event.key === 'Tab') {
+            const nodes = Array.from(dialog.querySelectorAll('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), summary'));
+            const first = nodes[0];
+            const last = nodes.at(-1);
+            if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+            else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+        }
+    };
+    document.addEventListener('keydown', view.keyHandler);
+    const viewport = globalThis.visualViewport;
+    if (viewport) {
+        const resize = () => {
+            dialog.style.setProperty('--bts-viewport-height', `${viewport.height}px`);
+            dialog.style.setProperty('--bts-viewport-top', `${viewport.offsetTop}px`);
+        };
+        resize();
+        viewport.addEventListener('resize', resize);
+        viewport.addEventListener('scroll', resize);
+        view.viewportCleanup = () => {
+            viewport.removeEventListener('resize', resize);
+            viewport.removeEventListener('scroll', resize);
+        };
+    }
 }
 
 async function sendQuestion(view) {
@@ -205,6 +303,9 @@ function openInterview(session) {
     view.participants = element('div', 'bts-participants');
     controls.append(view.participants);
     renderParticipants(view);
+    view.detectionStatus = element('div', 'bts-muted', 'Участники из карточек и персона доступны сразу. Поиск NPC использует выбранное подключение.');
+    view.detectionStatus.setAttribute('role', 'status');
+    controls.append(button('Найти NPC в сцене', () => void detectParticipants(view)), view.detectionStatus);
 
     const cardSelect = element('select', 'text_pole');
     cardSelect.add(new Option('Выберите карточку…', ''));
@@ -305,13 +406,10 @@ function openInterview(session) {
     dialog.addEventListener('cancel', event => { event.preventDefault(); closeInterview(); });
     document.body.append(dialog);
     renderMessages(view);
-    if (typeof dialog.showModal === 'function') {
-        dialog.showModal();
-    } else {
-        // Compatibility fallback for browsers/themes that replace the dialog element.
-        dialog.setAttribute('open', '');
-    }
-    view.input.focus();
+    showInterviewWindow(view);
+    // Don't summon the phone keyboard before the user can choose participants.
+    if (!globalThis.matchMedia?.('(pointer: coarse)').matches) view.input.focus();
+    return view;
 }
 
 async function startInterview(messageIndex) {
@@ -325,17 +423,12 @@ async function startInterview(messageIndex) {
     try {
         const context = getContext();
         const session = createSession(context.chat, messageIndex, settings);
-        const cardId = Object.keys(context.characters || {}).find(id => context.characters[id]?.name === session.sceneName);
-        if (cardId !== undefined) {
-            await context.unshallowCharacter?.(cardId);
-            if (!sameChat(snapshot)) return;
-            session.participants.push(participantFromCard(getContext().characters[cardId]));
-        } else if (!context.chat[messageIndex].is_user && !context.chat[messageIndex].is_system) {
-            session.participants.push({ id: createId(), name: session.sceneName, description: '', selected: true });
-        }
+        mergeParticipants(session, collectSceneParticipants(context, session));
         getStore(getContext().chatMetadata).sessions.unshift(session);
-        openInterview(session);
+        const view = openInterview(session);
         renderHistory();
+        void hydrateParticipants(view);
+        if (settings.autoDetect !== false) void detectParticipants(view);
         await persist(snapshot);
     } catch (error) { reportError(error); }
 }
@@ -397,6 +490,16 @@ function createUI() {
         renderHistory();
     });
     drawer.append(labeled('Включить расширение', enabled));
+    const autoDetect = element('input');
+    autoDetect.type = 'checkbox';
+    autoDetect.checked = settings.autoDetect !== false;
+    autoDetect.addEventListener('change', () => { settings.autoDetect = autoDetect.checked; saveSettings(); });
+    drawer.append(labeled('Автоматически искать NPC моделью при открытии (дополнительный запрос)', autoDetect));
+    drawer.append(button('🎬 Интервью по последнему сообщению', () => {
+        const chat = getContext().chat || [];
+        if (!chat.length) return toastr.warning('Откройте чат с сообщениями.');
+        void startInterview(chat.length - 1);
+    }));
     const list = element('div');
     list.id = 'bts-interview-list';
     drawer.append(element('h4', '', 'Интервью текущего чата'), list);
@@ -418,10 +521,22 @@ jQuery(() => {
         const on = (name, handler) => { if (events?.[name]) context.eventSource.on(events[name], handler); };
         on('CHAT_CHANGED', () => { chatEpoch++; closeInterview(); renderHistory(); syncButtons(); });
         for (const name of ['CHARACTER_MESSAGE_RENDERED', 'USER_MESSAGE_RENDERED', 'MORE_MESSAGES_LOADED', 'MESSAGE_SWIPED']) on(name, syncButtons);
-        on('GENERATION_STARTED', () => { mainGenerating = true; });
+        on('GENERATION_STARTED', (_type, _options, dryRun) => { if (!dryRun) mainGenerating = true; });
         on('GENERATION_ENDED', () => { mainGenerating = false; });
+        on('GENERATION_STOPPED', () => { mainGenerating = false; });
         $(document).on('mouseenter.bts focusin.bts', '.mes', syncButtons);
-        console.log('[Behind the Scene] Mini-chat v2.0.1 loaded');
+        // Themes may clone controls, losing direct listeners. Delegation covers those taps.
+        $(document).on('click.bts', '.bts-interview-btn', function(event) {
+            event.preventDefault();
+            event.stopPropagation();
+            const message = this.closest('.mes');
+            if (message) void startInterview(Number(message.getAttribute('mesid')));
+        });
+        const chatNode = document.getElementById('chat');
+        if (chatNode && typeof MutationObserver !== 'undefined') {
+            new MutationObserver(syncButtons).observe(chatNode, { childList: true, subtree: true });
+        }
+        console.log('[Behind the Scene] Mini-chat v2.1.0 loaded');
     } catch (error) { reportError(error); }
 });
 

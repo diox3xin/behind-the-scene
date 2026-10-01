@@ -19,12 +19,15 @@
     padding: 2px;
     margin: 0 0 0 5px;
     font-size: 16px;
+    touch-action: manipulation;
 }
 
 dialog.bts-dialog {
     box-sizing: border-box;
     width: min(1050px, 96vw);
     max-width: 96vw;
+    height: 90vh;
+    max-height: 90vh;
     height: min(820px, 90dvh);
     max-height: 90dvh;
     padding: 16px;
@@ -45,6 +48,20 @@ dialog.bts-dialog[open] {
 
 .bts-dialog::backdrop {
     background: rgb(0 0 0 / 65%);
+}
+
+.bts-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgb(0 0 0 / 65%);
+    z-index: 2147483645;
+}
+
+dialog.bts-dialog-fallback[open] {
+    position: fixed;
+    inset: 0;
+    margin: auto;
+    z-index: 2147483646;
 }
 
 .bts-dialog-header,
@@ -200,8 +217,21 @@ dialog.bts-dialog[open] {
 }
 
 @media (max-width: 650px) {
-    dialog.bts-dialog { padding: 10px; height: 94dvh; max-height: 94dvh; }
-    .bts-dialog-body { display: flex; flex-direction: column; gap: 8px; }
-    .bts-sidebar { max-height: 28dvh; flex-shrink: 0; }
-    .bts-conversation { flex: 1; }
+    dialog.bts-dialog[open] {
+        position: fixed;
+        inset: var(--bts-viewport-top, 0px) 0 auto;
+        margin: 0 auto;
+        padding: 10px;
+        width: 100%;
+        max-width: 100%;
+        height: var(--bts-viewport-height, 100vh);
+        max-height: var(--bts-viewport-height, 100vh);
+        border-radius: 0;
+    }
+    .bts-dialog-body { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+    .bts-sidebar { max-height: 30vh; max-height: 30dvh; flex-shrink: 0; }
+    .bts-conversation { flex: 1 0 320px; }
+    .bts-dialog .text_pole { font-size: 16px; }
+    .bts-dialog .menu_button { min-height: 40px; }
+    .bts-interview-btn { min-width: 40px; min-height: 40px; }
 }
