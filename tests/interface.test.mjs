@@ -25,6 +25,7 @@ class Node {
     }
     replaceChildren(...children) { this.children = []; this.append(...children); }
     setAttribute(key, value) { this.attributes[key] = value; }
+    removeAttribute(key) { delete this.attributes[key]; }
     getAttribute(key) { return this.attributes[key] ?? null; }
     addEventListener(name, listener) { this.listeners[name] = listener; }
     async fire(name, args = {}) { await this.listeners[name]?.({ stopPropagation() {}, preventDefault() {}, ...args }); }
@@ -78,7 +79,7 @@ function setup() {
         ...core, document, getContext: () => context,
         jQuery: callback => callback(), $: () => ({ on() {} }),
         Option: class extends Node { constructor(text, value) { super('option'); this.textContent = text; this.value = value; } },
-        AbortController, console: { log() {}, error: error => errors.push(error) },
+        AbortController, console: { log() {}, info() {}, debug() {}, warn() {}, error: error => errors.push(error) },
         toastr: { error: text => errors.push(text), warning() {}, info() {} }, confirm: () => true,
     });
     return {
@@ -173,4 +174,22 @@ test('disable removes message buttons; enable reinstates them', async () => {
     checkbox.checked = true;
     await checkbox.fire('change');
     assert.equal(app.body.querySelectorAll('.bts-interview-btn').length, 1);
+});
+
+test('opens when context provides getCurrentChatId but no chatId property', async () => {
+    const app = setup();
+    delete app.context().chatId;
+    app.context().getCurrentChatId = () => 'legacy-chat';
+    const dialog = await app.open();
+    assert.ok(dialog?.open);
+    assert.equal(app.errors.length, 0);
+    assert.equal(app.state.calls, 0);
+});
+
+test('opens with selected character and messages even without either chat ID API', async () => {
+    const app = setup();
+    delete app.context().chatId;
+    const dialog = await app.open();
+    assert.ok(dialog?.open);
+    assert.equal(app.errors.length, 0);
 });

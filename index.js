@@ -29,19 +29,31 @@ function reportError(error) {
     toastr.error(error.message || String(error), 'Behind the Scene');
 }
 
+function chatKey(context = getContext()) {
+    const currentId = context.getCurrentChatId?.() ?? context.chatId;
+    if (currentId !== undefined && currentId !== null && currentId !== '') return String(currentId);
+    if (context.chatMetadata?.integrity) return `metadata:${context.chatMetadata.integrity}`;
+    return `context:${context.characterId ?? 'none'}:${context.groupId ?? 'none'}`;
+}
+
 function hasChat(context = getContext()) {
-    return context.chatId !== undefined && context.chatId !== null && context.chatId !== '';
+    const id = context.getCurrentChatId?.() ?? context.chatId;
+    return Array.isArray(context.chat) && (
+        (id !== undefined && id !== null && id !== '')
+        || (context.chat.length > 0 && (context.characterId !== undefined && context.characterId !== null
+            || context.groupId !== undefined && context.groupId !== null))
+    );
 }
 
 function captureChat() {
     const context = getContext();
-    return { metadata: context.chatMetadata, id: context.chatId, character: context.characterId, group: context.groupId, epoch: chatEpoch };
+    return { metadata: context.chatMetadata, id: chatKey(context), character: context.characterId, group: context.groupId, epoch: chatEpoch };
 }
 
 function sameChat(snapshot) {
     const context = getContext();
     return snapshot.epoch === chatEpoch && snapshot.metadata === context.chatMetadata
-        && snapshot.id === context.chatId && snapshot.character === context.characterId && snapshot.group === context.groupId;
+        && snapshot.id === chatKey(context) && snapshot.character === context.characterId && snapshot.group === context.groupId;
 }
 
 async function persist(snapshot = captureChat()) {
@@ -59,7 +71,8 @@ function closeInterview() {
     const view = activeWindow;
     activeWindow = null;
     view.controller?.abort();
-    view.dialog.close();
+    view.dialog.close?.();
+    view.dialog.removeAttribute('open');
     view.dialog.remove();
 }
 
@@ -173,6 +186,7 @@ async function sendQuestion(view) {
 }
 
 function openInterview(session) {
+    console.info('[Behind the Scene] Opening mini-chat', { sessionId: session.id, chat: chatKey() });
     closeInterview();
     const dialog = element('dialog', 'bts-dialog');
     dialog.setAttribute('aria-labelledby', 'bts-dialog-title');
@@ -291,12 +305,22 @@ function openInterview(session) {
     dialog.addEventListener('cancel', event => { event.preventDefault(); closeInterview(); });
     document.body.append(dialog);
     renderMessages(view);
-    dialog.showModal();
+    if (typeof dialog.showModal === 'function') {
+        dialog.showModal();
+    } else {
+        // Compatibility fallback for browsers/themes that replace the dialog element.
+        dialog.setAttribute('open', '');
+    }
     view.input.focus();
 }
 
 async function startInterview(messageIndex) {
-    if (!settings.enabled || !hasChat()) return;
+    if (!settings.enabled || !hasChat()) {
+        console.warn('[Behind the Scene] Cannot open mini-chat: no active SillyTavern chat context.');
+        toastr.warning('Не удалось определить открытый чат. Откройте чат с персонажем и повторите.');
+        return;
+    }
+    console.info('[Behind the Scene] Scene button clicked', { messageIndex, chat: chatKey() });
     const snapshot = captureChat();
     try {
         const context = getContext();
@@ -397,7 +421,7 @@ jQuery(() => {
         on('GENERATION_STARTED', () => { mainGenerating = true; });
         on('GENERATION_ENDED', () => { mainGenerating = false; });
         $(document).on('mouseenter.bts focusin.bts', '.mes', syncButtons);
-        console.log('[Behind the Scene] Mini-chat v2 loaded');
+        console.log('[Behind the Scene] Mini-chat v2.0.1 loaded');
     } catch (error) { reportError(error); }
 });
 
