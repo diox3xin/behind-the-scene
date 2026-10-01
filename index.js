@@ -31,7 +31,7 @@
     }
 
     async function generateInterview(messageIndex) {
-        const context = SillyTavern.getContext();
+        const context = getContext();
         
         if (!context.chat || context.chat.length === 0) {
             toastr.warning('Нет сообщений для интервью');
