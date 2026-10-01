@@ -1,8 +1,10 @@
+const MODULE_NAME = 'behind-the-scene';
+
 (function() {
     'use strict';
 
-    const extensionName = 'behind-the-scenes';
-    const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
+    const extensionName = MODULE_NAME;
+    const extensionFolderPath = `scripts/extensions/${extensionName}`;
 
     let interviewHistory = [];
 
@@ -252,3 +254,5 @@ ${characterName} (как актёр): `;
     });
 })();
 
+// Export required for SillyTavern
+export { MODULE_NAME };
