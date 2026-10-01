@@ -180,3 +180,75 @@ ${characterName} (как актёр): `;
             mesBlock.find('.mes_buttons').append(btn);
         });
     }
+
+    function createUI() {
+        const drawerContent = `
+            <div id="bts-panel">
+                <div class="inline-drawer">
+                    <div class="inline-drawer-toggle inline-drawer-header">
+                        <b>🎬 Behind the Scenes</b>
+                        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                    </div>
+                    <div class="inline-drawer-content">
+                        <div class="bts-controls">
+                            <label class="checkbox_label">
+                                <input id="bts-enabled" type="checkbox" />
+                                <span>Включить расширение</span>
+                            </label>
+                            <label class="checkbox_label">
+                                <input id="bts-include-context" type="checkbox" />
+                                <span>Включать контекст сцены</span>
+                            </label>
+                        </div>
+                        <div class="bts-interview-section">
+                            <h3>История интервью</h3>
+                            <div id="bts-interview-list"></div>
+                        </div>
+                        <div class="bts-actions">
+                            <button id="bts-clear-history" class="menu_button">
+                                🗑️ Очистить историю
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+        
+        $('#extensions_settings2').append(drawerContent);
+        $('#bts-enabled').prop('checked', extension_settings[extensionName].enabled);
+        $('#bts-include-context').prop('checked', extension_settings[extensionName].includeContext);
+        
+        $('#bts-enabled').on('change', function() {
+            extension_settings[extensionName].enabled = $(this).prop('checked');
+            saveSettings();
+        });
+        
+        $('#bts-include-context').on('change', function() {
+            extension_settings[extensionName].includeContext = $(this).prop('checked');
+            saveSettings();
+        });
+        
+        $('#bts-clear-history').on('click', function() {
+            if (confirm('Удалить все интервью?')) {
+                interviewHistory = [];
+                saveSettings();
+                updateInterviewList();
+                toastr.success('История очищена');
+            }
+        });
+        
+        updateInterviewList();
+    }
+
+    jQuery(async () => {
+        loadSettings();
+        createUI();
+        
+        if (extension_settings[extensionName].enabled) {
+            addInterviewButtons();
+        }
+        
+        console.log('Behind the Scenes extension loaded');
+    });
+})();
+
