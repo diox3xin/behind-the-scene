@@ -1,3 +1,15 @@
+import {
+    extension_settings,
+    getContext,
+} from '../../../extensions.js';
+
+import {
+    chat_metadata,
+    saveSettingsDebounced,
+    generateQuietPrompt,
+    callPopup,
+} from '../../../../script.js';
+
 const MODULE_NAME = 'behind-the-scene';
 
 (function() {
@@ -247,31 +259,21 @@ ${characterName} (как актёр): `;
         updateInterviewList();
     }
 
-    jQuery(async () => {
-        // Wait for SillyTavern to initialize
-        const waitForGlobals = setInterval(() => {
-            if (typeof extension_settings !== 'undefined' && 
-                typeof chat_metadata !== 'undefined' && 
-                typeof getContext !== 'undefined') {
-                clearInterval(waitForGlobals);
-                
-                loadSettings();
-                createUI();
-                
-                if (extension_settings[extensionName].enabled) {
-                    addInterviewButtons();
-                }
-                
-                console.log('[Behind the Scene] Extension loaded successfully');
-            }
-        }, 100);
-        
-        // Timeout after 10 seconds
-        setTimeout(() => {
-            clearInterval(waitForGlobals);
-            console.error('[Behind the Scene] Failed to initialize - SillyTavern globals not available');
-        }, 10000);
-    });
+jQuery(() => {
+    try {
+        loadSettings();
+        createUI();
+
+        if (extension_settings[extensionName].enabled) {
+            addInterviewButtons();
+        }
+
+        console.log('[Behind the Scene] Extension loaded successfully');
+    } catch (error) {
+        console.error('[Behind the Scene] Initialization failed:', error);
+    }
+});
+
 })();
 
 // Export required for SillyTavern
