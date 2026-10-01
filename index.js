@@ -1,65 +1,57 @@
-import { saveSettingsDebounced, chat_metadata, this_chid, characters, callPopup } from '../../../../script.js';
-import { extension_settings, getContext } from '../../../extensions.js';
-import { generateQuietPrompt } from '../../../generation.js';
+(function() {
+    'use strict';
 
-const extensionName = 'behind-the-scenes';
-const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
+    const extensionName = 'behind-the-scenes';
+    const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
 
-let interviewHistory = [];
+    let interviewHistory = [];
 
-const defaultSettings = {
-    enabled: true,
-    interviewStyle: 'casual',
-    includeContext: true,
-    maxInterviews: 50
-};
+    const defaultSettings = {
+        enabled: true,
+        interviewStyle: 'casual',
+        includeContext: true,
+        maxInterviews: 50
+    };
 
-function loadSettings() {
-    extension_settings[extensionName] = extension_settings[extensionName] || {};
-    if (Object.keys(extension_settings[extensionName]).length === 0) {
-        Object.assign(extension_settings[extensionName], defaultSettings);
+    function loadSettings() {
+        extension_settings[extensionName] = extension_settings[extensionName] || {};
+        if (Object.keys(extension_settings[extensionName]).length === 0) {
+            Object.assign(extension_settings[extensionName], defaultSettings);
+        }
+        
+        if (chat_metadata[extensionName]) {
+            interviewHistory = chat_metadata[extensionName].history || [];
+        }
     }
-    
-    // Загружаем историю интервью из метаданных чата
-    if (chat_metadata[extensionName]) {
-        interviewHistory = chat_metadata[extensionName].history || [];
-    }
-}
 
-function saveSettings() {
-    saveSettingsDebounced();
-    
-    // Сохраняем историю в метаданные чата
-    chat_metadata[extensionName] = chat_metadata[extensionName] || {};
-    chat_metadata[extensionName].history = interviewHistory;
-}
+    function saveSettings() {
+        saveSettingsDebounced();
+        chat_metadata[extensionName] = chat_metadata[extensionName] || {};
+        chat_metadata[extensionName].history = interviewHistory;
+    }
 
-async function generateInterview(messageIndex) {
-    const context = getContext();
-    
-    if (!context.chat || context.chat.length === 0) {
-        toastr.warning('Нет сообщений для интервью');
-        return;
-    }
-    
-    const message = context.chat[messageIndex];
-    if (!message) {
-        toastr.warning('Сообщение не найдено');
-        return;
-    }
-    
-    const characterName = message.name || 'Персонаж';
-    const sceneText = message.mes;
-    
-    // Собираем контекст сцены (несколько сообщений до и после)
-    const contextStart = Math.max(0, messageIndex - 2);
-    const contextEnd = Math.min(context.chat.length, messageIndex + 3);
-    const sceneContext = context.chat.slice(contextStart, contextEnd)
-        .map(msg => `${msg.name}: ${msg.mes}`)
-        .join('\n\n');
-    
-    // Создаём промпт для интервью
-    const interviewPrompt = `[Это закулисное интервью. ${characterName} — актёр/актриса, который(ая) только что сыграл(а) сцену в фильме/сериале. Веди себя как актёр, обсуждающий свою роль, эмоции, трудности съёмки и взаимодействие с партнёрами по съёмочной площадке.]
+    async function generateInterview(messageIndex) {
+        const context = SillyTavern.getContext();
+        
+        if (!context.chat || context.chat.length === 0) {
+            toastr.warning('Нет сообщений для интервью');
+            return;
+        }
+        
+        const message = context.chat[messageIndex];
+        if (!message) {
+            toastr.warning('Сообщение не найдено');
+            return;
+        }
+        
+        const characterName = message.name || 'Персонаж';
+        const sceneText = message.mes;
+        const contextStart = Math.max(0, messageIndex - 2);
+        const contextEnd = Math.min(context.chat.length, messageIndex + 3);
+        const sceneContext = context.chat.slice(contextStart, contextEnd)
+            .map(msg => `${msg.name}: ${msg.mes}`).join('\n\n');
+        
+        const interviewPrompt = `[Это закулисное интервью. ${characterName} — актёр/актриса, который(ая) только что сыграл(а) сцену в фильме/сериале. Веди себя как актёр, обсуждающий свою роль, эмоции, трудности съёмки и взаимодействие с партнёрами по съёмочной площадке.]
 
 Интервьюер: Спасибо, что нашли время! Расскажите о сцене, которую вы только что сняли.
 
@@ -70,219 +62,121 @@ ${extension_settings[extensionName].includeContext ? `\nКонтекст сце�
 
 ${characterName} (как актёр): `;
 
-    // Показываем индикатор загрузки
-    const loadingToast = toastr.info('Генерация интервью...', '', { timeOut: 0 });
-    
-    try {
-        // Генерируем ответ
-        const interview = await generateQuietPrompt(interviewPrompt, false, false);
+        const loadingToast = toastr.info('Генерация интервью...', '', { timeOut: 0 });
         
-        // Сохраняем интервью
-        const interviewData = {
-            id: Date.now(),
-            timestamp: new Date().toISOString(),
-            character: characterName,
-            messageIndex: messageIndex,
-            scene: sceneText,
-            interview: interview,
-            context: extension_settings[extensionName].includeContext ? sceneContext : null
-        };
+        try {
+            const interview = await generateQuietPrompt(interviewPrompt, false, false);
+            const interviewData = {
+                id: Date.now(),
+                timestamp: new Date().toISOString(),
+                character: characterName,
+                messageIndex: messageIndex,
+                scene: sceneText,
+                interview: interview,
+                context: extension_settings[extensionName].includeContext ? sceneContext : null
+            };
+            
+            interviewHistory.unshift(interviewData);
+            if (interviewHistory.length > extension_settings[extensionName].maxInterviews) {
+                interviewHistory = interviewHistory.slice(0, extension_settings[extensionName].maxInterviews);
+            }
+            
+            saveSettings();
+            toastr.clear(loadingToast);
+            toastr.success('Интервью сгенерировано!');
+            showInterviewPopup(interviewData);
+            updateInterviewList();
+        } catch (error) {
+            toastr.clear(loadingToast);
+            toastr.error('Ошибка генерации интервью: ' + error.message);
+            console.error('Interview generation error:', error);
+        }
+    }
+
+    function showInterviewPopup(interviewData) {
+        const popup = `
+            <div class="bts-interview-popup">
+                <div class="bts-interview-header">
+                    <h3>🎬 Интервью: ${interviewData.character}</h3>
+                    <small>${new Date(interviewData.timestamp).toLocaleString('ru-RU')}</small>
+                </div>
+                <div class="bts-interview-scene">
+                    <h4>Сцена:</h4>
+                    <p>${interviewData.scene}</p>
+                </div>
+                <div class="bts-interview-content">
+                    <h4>Интервью:</h4>
+                    <p>${interviewData.interview}</p>
+                </div>
+            </div>
+        `;
+        callPopup(popup, 'text', '', { wide: true, large: true });
+    }
+
+    function updateInterviewList() {
+        const container = $('#bts-interview-list');
+        if (!container.length) return;
+        container.empty();
         
-        interviewHistory.unshift(interviewData);
-        
-        // Ограничиваем размер истории
-        if (interviewHistory.length > extension_settings[extensionName].maxInterviews) {
-            interviewHistory = interviewHistory.slice(0, extension_settings[extensionName].maxInterviews);
+        if (interviewHistory.length === 0) {
+            container.append('<div class="bts-no-interviews">Интервью пока нет. Нажмите на кнопку 🎬 рядом с сообщением!</div>');
+            return;
         }
         
-        saveSettings();
-        
-        toastr.clear(loadingToast);
-        toastr.success('Интервью сгенерировано!');
-        
-        // Показываем интервью
-        showInterviewPopup(interviewData);
-        updateInterviewList();
-        
-    } catch (error) {
-        toastr.clear(loadingToast);
-        toastr.error('Ошибка генерации интервью: ' + error.message);
-        console.error('Interview generation error:', error);
-    }
-}
-
-function showInterviewPopup(interviewData) {
-    const popup = `
-        <div class="bts-interview-popup">
-            <div class="bts-interview-header">
-                <h3>🎬 Интервью: ${interviewData.character}</h3>
-                <small>${new Date(interviewData.timestamp).toLocaleString('ru-RU')}</small>
-            </div>
-            <div class="bts-interview-scene">
-                <h4>Сцена:</h4>
-                <p>${interviewData.scene}</p>
-            </div>
-            <div class="bts-interview-content">
-                <h4>Интервью:</h4>
-                <p>${interviewData.interview}</p>
-            </div>
-        </div>
-    `;
-    
-    callPopup(popup, 'text', '', { wide: true, large: true });
-}
-
-function updateInterviewList() {
-    const container = $('#bts-interview-list');
-    if (!container.length) return;
-    
-    container.empty();
-    
-    if (interviewHistory.length === 0) {
-        container.append('<div class="bts-no-interviews">Интервью пока нет. Нажмите на кнопку 🎬 рядом с сообщением!</div>');
-        return;
-    }
-    
-    interviewHistory.forEach(interview => {
-        const item = $(`
-            <div class="bts-interview-item" data-interview-id="${interview.id}">
-                <div class="bts-interview-item-header">
-                    <strong>${interview.character}</strong>
-                    <small>${new Date(interview.timestamp).toLocaleString('ru-RU')}</small>
+        interviewHistory.forEach(interview => {
+            const item = $(`
+                <div class="bts-interview-item" data-interview-id="${interview.id}">
+                    <div class="bts-interview-item-header">
+                        <strong>${interview.character}</strong>
+                        <small>${new Date(interview.timestamp).toLocaleString('ru-RU')}</small>
+                    </div>
+                    <div class="bts-interview-item-preview">
+                        ${interview.scene.substring(0, 100)}${interview.scene.length > 100 ? '...' : ''}
+                    </div>
+                    <button class="bts-view-btn menu_button" data-interview-id="${interview.id}">
+                        👁️ Посмотреть
+                    </button>
+                    <button class="bts-delete-btn menu_button" data-interview-id="${interview.id}">
+                        🗑️ Удалить
+                    </button>
                 </div>
-                <div class="bts-interview-item-preview">
-                    ${interview.scene.substring(0, 100)}${interview.scene.length > 100 ? '...' : ''}
-                </div>
-                <button class="bts-view-btn menu_button" data-interview-id="${interview.id}">
-                    👁️ Посмотреть
-                </button>
-                <button class="bts-delete-btn menu_button" data-interview-id="${interview.id}">
-                    🗑️ Удалить
-                </button>
-            </div>
-        `);
-        
-        container.append(item);
-    });
-    
-    // Обработчики событий
-    $('.bts-view-btn').on('click', function() {
-        const id = $(this).data('interview-id');
-        const interview = interviewHistory.find(i => i.id === id);
-        if (interview) {
-            showInterviewPopup(interview);
-        }
-    });
-    
-    $('.bts-delete-btn').on('click', function() {
-        const id = $(this).data('interview-id');
-        interviewHistory = interviewHistory.filter(i => i.id !== id);
-        saveSettings();
-        updateInterviewList();
-        toastr.success('Интервью удалено');
-    });
-}
-
-function addInterviewButtons() {
-    // Добавляем кнопки к сообщениям
-    $(document).on('mouseenter', '.mes', function() {
-        const mesBlock = $(this);
-        
-        // Проверяем, есть ли уже кнопка
-        if (mesBlock.find('.bts-interview-btn').length > 0) return;
-        
-        // Получаем индекс сообщения
-        const messageIndex = mesBlock.attr('mesid');
-        
-        // Создаём кнопку
-        const btn = $(`
-            <div class="bts-interview-btn" title="Взять интервью о сцене" data-message-index="${messageIndex}">
-                🎬
-            </div>
-        `);
-        
-        btn.on('click', function(e) {
-            e.stopPropagation();
-            const index = parseInt($(this).data('message-index'));
-            generateInterview(index);
+            `);
+            container.append(item);
         });
         
-        mesBlock.find('.mes_buttons').append(btn);
-    });
-}
-
-function createUI() {
-    // Добавляем кнопку в панель расширений
-    const drawerContent = `
-        <div id="bts-panel">
-            <div class="inline-drawer">
-                <div class="inline-drawer-toggle inline-drawer-header">
-                    <b>🎬 Behind the Scenes</b>
-                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-                </div>
-                <div class="inline-drawer-content">
-                    <div class="bts-controls">
-                        <label class="checkbox_label">
-                            <input id="bts-enabled" type="checkbox" />
-                            <span>Включить расширение</span>
-                        </label>
-                        <label class="checkbox_label">
-                            <input id="bts-include-context" type="checkbox" />
-                            <span>Включать контекст сцены</span>
-                        </label>
-                    </div>
-                    <div class="bts-interview-section">
-                        <h3>История интервью</h3>
-                        <div id="bts-interview-list"></div>
-                    </div>
-                    <div class="bts-actions">
-                        <button id="bts-clear-history" class="menu_button">
-                            🗑️ Очистить историю
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    `;
-    
-    $('#extensions_settings2').append(drawerContent);
-    
-    // Загружаем настройки в UI
-    $('#bts-enabled').prop('checked', extension_settings[extensionName].enabled);
-    $('#bts-include-context').prop('checked', extension_settings[extensionName].includeContext);
-    
-    // Обработчики событий
-    $('#bts-enabled').on('change', function() {
-        extension_settings[extensionName].enabled = $(this).prop('checked');
-        saveSettings();
-    });
-    
-    $('#bts-include-context').on('change', function() {
-        extension_settings[extensionName].includeContext = $(this).prop('checked');
-        saveSettings();
-    });
-    
-    $('#bts-clear-history').on('click', function() {
-        if (confirm('Удалить все интервью?')) {
-            interviewHistory = [];
+        $('.bts-view-btn').on('click', function() {
+            const id = $(this).data('interview-id');
+            const interview = interviewHistory.find(i => i.id === id);
+            if (interview) showInterviewPopup(interview);
+        });
+        
+        $('.bts-delete-btn').on('click', function() {
+            const id = $(this).data('interview-id');
+            interviewHistory = interviewHistory.filter(i => i.id !== id);
             saveSettings();
             updateInterviewList();
-            toastr.success('История очищена');
-        }
-    });
-    
-    // Инициализируем список
-    updateInterviewList();
-}
-
-// Инициализация расширения
-jQuery(async () => {
-    loadSettings();
-    createUI();
-    
-    if (extension_settings[extensionName].enabled) {
-        addInterviewButtons();
+            toastr.success('Интервью удалено');
+        });
     }
-    
-    console.log('Behind the Scenes extension loaded');
-});
+
+    function addInterviewButtons() {
+        $(document).on('mouseenter', '.mes', function() {
+            const mesBlock = $(this);
+            if (mesBlock.find('.bts-interview-btn').length > 0) return;
+            
+            const messageIndex = mesBlock.attr('mesid');
+            const btn = $(`
+                <div class="bts-interview-btn" title="Взять интервью о сцене" data-message-index="${messageIndex}">
+                    🎬
+                </div>
+            `);
+            
+            btn.on('click', function(e) {
+                e.stopPropagation();
+                const index = parseInt($(this).data('message-index'));
+                generateInterview(index);
+            });
+            
+            mesBlock.find('.mes_buttons').append(btn);
+        });
+    }
