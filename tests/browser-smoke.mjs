@@ -18,7 +18,13 @@ window.context = {
  chatId: 'test', characterId: 0, chatMetadata: {}, name1: 'Ева', powerUserSettings: { persona_description: 'Персона' },
  chat: [{ name: 'Тайлер', mes: 'Тайлер и Ева у бармена.' }],
  characters: [{ name: 'Тайлер', avatar: 't.png' }],
- extensionSettings: { 'behind-the-scene': { autoDetect: false } },
+ extensionSettings: { 'behind-the-scene': { autoDetect: false, profileId: 'test' }, connectionManager: { profiles: [{ id: 'test' }] } },
+ ConnectionManagerRequestService: { sendRequest: async () => async function* () {
+  await new Promise(r => setTimeout(r, 100));
+  yield { text: 'Тайлер: *улыбнулся*' };
+  await new Promise(r => setTimeout(r, 500));
+  yield { text: 'Тайлер: *улыбнулся* «Да».' };
+ } },
  saveMetadata: async () => {}, saveSettingsDebounced() {},
  unshallowCharacter: () => new Promise(() => {}),
  generateRaw: async () => 'Тайлер: *улыбнулся* «Да».',
@@ -48,8 +54,15 @@ try {
  events.start('normal', {}, true);
  dialog.querySelector('.bts-question').value = 'Вопрос';
  [...dialog.querySelectorAll('button')].find(b => b.textContent === 'Спросить').click();
- await new Promise(r => setTimeout(r, 50));
- check(dialog.querySelectorAll('.bts-bubble').length === 2, 'dryRun blocked interview');
+ check(dialog.querySelectorAll('.bts-bubble').length === 2, 'Question and waiting bubble must appear synchronously');
+ const bubble = dialog.querySelector('.bts-assistant');
+ await new Promise(r => setTimeout(r, 250));
+ check(bubble.textContent.includes('улыбнулся'), 'Partial stream text missing');
+ check(!bubble.textContent.includes('«Да»'), 'Stream finished too early for partial check');
+ check(dialog.querySelector('.bts-assistant') === bubble, 'Streaming should update the existing bubble');
+ await new Promise(r => setTimeout(r, 500));
+ check(dialog.querySelector('.bts-assistant').textContent.includes('«Да»'), 'Final stream text missing');
+ check(!dialog.querySelector('.bts-typing'), 'Typing indicator must clear');
  [...dialog.querySelectorAll('button')].find(b => b.textContent === 'Закрыть').click();
  check(!document.querySelector('.bts-dialog'), 'Dialog failed to close');
  check(!document.querySelector('.bts-backdrop'), 'Fallback backdrop leaked');
@@ -63,7 +76,7 @@ const server = createServer(async (req, res) => {
         const path = req.url.split('?')[0];
         if (path === '/') { res.setHeader('Content-Type', 'text/html; charset=utf-8'); return res.end(fixture); }
         if (path === '/extensions.js') { res.setHeader('Content-Type', 'text/javascript'); return res.end('export const getContext = () => window.context;'); }
-        const files = { '/index.js': 'index.js', '/interview-core.mjs': 'interview-core.mjs', '/style.css': 'style.css' };
+ const files = { '/index.js': 'index.js', '/interview-core.mjs': 'interview-core.mjs', '/main-stream.mjs': 'main-stream.mjs', '/style.css': 'style.css' };
         if (!files[path]) { res.statusCode = 404; return res.end(); }
         let content = await readFile(new URL(files[path], root), 'utf8');
         if (path === '/index.js') content = content.replace('../../../extensions.js', './extensions.js');

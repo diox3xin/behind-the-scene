@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     MODULE_NAME, normalizeSettings, createSession, getStore, participantFromCard,
-    buildRequest, requestInterview, generateTurn, StaleInterviewError,
-    collectSceneParticipants, mergeParticipants, parseDetectedParticipants, buildDetectionRequest,
+    buildRequest, requestInterview, generateTurn, beginTurn, finishTurn, discardTurn, streamInterview, StaleInterviewError,
+    collectSceneParticipants, mergeParticipants, parseDetectedParticipants, buildDetectionRequest, describeApiError,
 } from '../interview-core.mjs';
 
 function fixture() {
@@ -44,6 +44,18 @@ test('detection JSON is validated, duplicates preserve manual selection and desc
     session.includeContext = false;
     session.context = 'Скрытый контекст';
     assert.doesNotMatch(JSON.stringify(buildDetectionRequest(session)), /Скрытый контекст/);
+});
+
+test('API diagnostics unwrap cause and redact secrets', () => {
+    const error = new Error('API request failed', {
+        cause: new Error('401 Unauthorized api_key=sk-secret Bearer abc123', {
+            cause: { status: 502, body: { error: 'proxy failed', password: 'private-password' } },
+        }),
+    });
+    const details = describeApiError(error);
+    assert.match(details, /API request failed.*401 Unauthorized.*502/);
+    assert.doesNotMatch(details, /sk-secret|abc123|private-password/);
+    assert.match(details, /api_key=\[redacted\]/);
 });
 
 test('defaults fill partial old settings and clamp response limit', () => {
@@ -171,4 +183,34 @@ test('one successful generation commits exactly one question and one multi-parti
     assert.equal(session.messages.length, 2);
     assert.equal(session.messages[0].content, 'Вопрос');
     assert.deepEqual(session.messages[1].participants, ['Тайлер', 'Ева']);
+});
+
+test('streaming yields cumulative chunks and finishTurn marks the assistant complete', async () => {
+    const session = fixture();
+    const turn = beginTurn(session, 'Как вам?');
+    const chunks = [];
+    const context = {
+        generateRaw: async () => 'fallback',
+        ConnectionManagerRequestService: {
+            sendRequest: async () => async function* () {
+                yield { text: 'Тайлер: ' };
+                yield { text: 'Тайлер: *фыркнул* «Интенсивно».' };
+            },
+        },
+        extensionSettings: { connectionManager: { profiles: [{ id: 'p' }] } },
+    };
+    for await (const chunk of streamInterview(context, 'p', turn.request, new AbortController().signal)) chunks.push(chunk);
+    assert.deepEqual(chunks, ['Тайлер: ', 'Тайлер: *фыркнул* «Интенсивно».']);
+    finishTurn(turn, chunks.at(-1));
+    assert.equal(turn.assistant.pending, false);
+    assert.equal(turn.assistant.content, 'Тайлер: *фыркнул* «Интенсивно».');
+});
+
+test('failed streaming turn can be discarded without leaving pending context', () => {
+    const session = fixture();
+    const turn = beginTurn(session, 'Ошибка');
+    turn.assistant.pending = false;
+    turn.assistant.failed = true;
+    discardTurn(session, turn);
+    assert.deepEqual(session.messages, []);
 });

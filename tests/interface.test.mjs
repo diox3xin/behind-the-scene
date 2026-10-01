@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 import * as core from '../interview-core.mjs';
+import { requestMainStream } from '../main-stream.mjs';
 
 const source = (await readFile(new URL('../index.js', import.meta.url), 'utf8'))
     .replace(/import[\s\S]*?from\s+'[^']+';/g, '')
@@ -82,7 +83,7 @@ function setup(options = {}) {
         querySelectorAll: selector => body.querySelectorAll(selector),
     };
     vm.runInNewContext(source, {
-        ...core, document, getContext: () => context,
+        ...core, requestMainStream, document, getContext: () => context,
         jQuery: callback => callback(), $: () => ({ on() {} }),
         Option: class extends Node { constructor(text, value) { super('option'); this.textContent = text; this.value = value; } },
         AbortController, console: { log() {}, info() {}, debug() {}, warn() {}, error: error => errors.push(error) },
@@ -233,11 +234,14 @@ test('API failure preserves question and enables retry without duplicate turns',
     input.value = 'Вопрос';
     await app.byText('Спросить').fire('click');
     await flush();
-    assert.equal(input.value, 'Вопрос');
+    assert.equal(input.value, '');
     assert.equal(input.disabled, false);
-    assert.equal(core.getStore(app.context().chatMetadata).sessions[0].messages.length, 0);
+    const messages = core.getStore(app.context().chatMetadata).sessions[0].messages;
+    assert.equal(messages.length, 2);
+    assert.equal(messages[0].content, 'Вопрос');
+    assert.equal(messages[1].failed, true);
     app.context().generateRaw = async () => 'Повторный ответ';
-    await app.byText('Спросить').fire('click');
+    await app.byText('Повторить вопрос').fire('click');
     await flush();
     assert.equal(core.getStore(app.context().chatMetadata).sessions[0].messages.length, 2);
 });
@@ -255,7 +259,9 @@ test('chat switch closes window and late response never leaks into either chat',
     assert.equal(app.body.querySelector('dialog'), null);
     finish('Поздний ответ');
     await flush();
-    assert.equal(oldStore.sessions[0].messages.length, 0);
+    assert.equal(oldStore.sessions[0].messages.length, 2);
+    assert.equal(oldStore.sessions[0].messages[1].content, '');
+    assert.equal(oldStore.sessions[0].messages[1].failed, true);
     assert.equal(core.getStore(app.context().chatMetadata).sessions.length, 0);
     assert.equal(app.errors.length, 0);
 });
@@ -287,4 +293,84 @@ test('opens with selected character and messages even without either chat ID API
     const dialog = await app.open();
     assert.ok(dialog?.open);
     assert.equal(app.errors.length, 0);
+});
+
+function useStreamingProfile(app, factory) {
+    app.context().extensionSettings.connectionManager = { profiles: [{ id: 'stream', name: 'Stream' }] };
+    app.context().extensionSettings[core.MODULE_NAME].profileId = 'stream';
+    app.context().ConnectionManagerRequestService = { sendRequest: async (_id, _messages, _limit, options) => {
+        assert.equal(options.stream, true);
+        return () => factory(options.signal);
+    } };
+}
+
+test('question bubble appears immediately; same assistant bubble updates before completion', async () => {
+    const app = setup();
+    let first;
+    let finish;
+    const firstGate = new Promise(resolve => { first = resolve; });
+    const finishGate = new Promise(resolve => { finish = resolve; });
+    useStreamingProfile(app, async function* () {
+        await firstGate;
+        yield { text: 'Тайлер: <img src=x> *усмехнулся*' };
+        await finishGate;
+        yield { text: 'Тайлер: <img src=x> *усмехнулся* «Да».' };
+    });
+    const dialog = await app.open();
+    dialog.querySelector('.bts-question').value = 'Как вам?';
+    await app.byText('Спросить').fire('click');
+    const session = core.getStore(app.context().chatMetadata).sessions[0];
+    assert.equal(dialog.querySelectorAll('.bts-bubble').length, 2);
+    assert.equal(session.messages[0].content, 'Как вам?');
+    assert.equal(session.messages[1].pending, true);
+    const bubble = dialog.querySelector('.bts-assistant');
+    first();
+    await flush();
+    assert.equal(dialog.querySelector('.bts-assistant'), bubble);
+    assert.match(session.messages[1].content, /усмехнулся/);
+    assert.equal(session.messages[1].pending, true);
+    assert.equal(bubble.querySelectorAll('img').length, 0);
+    finish();
+    await flush();
+    assert.equal(session.messages[1].pending, false);
+    assert.match(session.messages[1].content, /«Да»/);
+    assert.equal(session.messages.length, 2);
+    assert.deepEqual(app.errors, []);
+});
+
+test('Stop aborts only interview stream and preserves partial reply as interrupted', async () => {
+    const app = setup();
+    useStreamingProfile(app, async function* (signal) {
+        yield { text: 'Частичный ответ' };
+        await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+    });
+    const dialog = await app.open();
+    dialog.querySelector('.bts-question').value = 'Вопрос';
+    await app.byText('Спросить').fire('click');
+    await flush();
+    await app.byText('Остановить').fire('click');
+    await flush();
+    const messages = core.getStore(app.context().chatMetadata).sessions[0].messages;
+    assert.equal(messages[1].content, 'Частичный ответ');
+    assert.equal(messages[1].pending, false);
+    assert.equal(messages[1].failed, true);
+    assert.ok(app.byText('Повторить вопрос'));
+    assert.deepEqual(app.errors, []);
+});
+
+test('mid-stream error keeps partial text and failed turn is excluded from the next prompt', async () => {
+    const app = setup();
+    useStreamingProfile(app, async function* () {
+        yield { text: 'Недописанная фраза' };
+        throw new Error('Connection lost');
+    });
+    const dialog = await app.open();
+    dialog.querySelector('.bts-question').value = 'Первый вопрос';
+    await app.byText('Спросить').fire('click');
+    await flush();
+    const session = core.getStore(app.context().chatMetadata).sessions[0];
+    assert.equal(session.messages[1].content, 'Недописанная фраза');
+    assert.equal(session.messages[1].failed, true);
+    const request = core.buildRequest(session, 'Другой вопрос');
+    assert.doesNotMatch(JSON.stringify(request.messages), /Недописанная|Первый вопрос/);
 });

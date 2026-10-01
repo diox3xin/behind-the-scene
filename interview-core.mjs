@@ -126,11 +126,71 @@ export function buildRequest(session, question) {
     const context = `Выбранные участники:\n${selected.map(p => `${p.name}: ${p.description || 'Ориентируйся на сцену.'}`).join('\n\n')}
 \nСцена:\n${session.scene}
 ${session.includeContext ? `\nСоседние сообщения:\n${session.context}` : ''}`;
-    const history = session.messages.slice(-20).map(m => ({ role: m.role, content: m.content }));
+    const history = session.messages.filter(m => !m.pending && !m.failed).slice(-20).map(m => ({ role: m.role, content: m.content }));
     return {
         messages: [{ role: 'system', content: system }, { role: 'user', content: context }, ...history, { role: 'user', content: text }],
         maxTokens: normalizeSettings(session).responseLength, participants: selected.map(p => p.name),
     };
+}
+
+export function beginTurn(session, question) {
+    const request = buildRequest(session, question);
+    const timestamp = new Date().toISOString();
+    const user = { role: 'user', content: question.trim(), participants: request.participants, timestamp };
+    const assistant = { role: 'assistant', content: '', participants: request.participants, timestamp, pending: true };
+    session.messages.push(user, assistant);
+    return { request, user, assistant };
+}
+
+export function finishTurn(turn, answer) {
+    if (typeof answer !== 'string' || !answer.trim()) throw new Error('Модель вернула пустой ответ.');
+    turn.assistant.content = answer.trim();
+    turn.assistant.pending = false;
+    return turn.assistant.content;
+}
+
+export function discardTurn(session, turn) {
+    session.messages = session.messages.filter(message => message !== turn.user && message !== turn.assistant);
+}
+
+function redactDiagnostic(value) {
+    return String(value)
+        .replace(/Bearer\s+[^\s"',;}]+/gi, 'Bearer [redacted]')
+        .replace(/(["']?(?:api[_-]?key|token|password|secret|authorization|proxy[_-]?password)["']?\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s,;}]+)/gi, '$1[redacted]')
+        .replace(/https?:\/\/[^\s"<>]+/gi, '[URL hidden]')
+        .slice(0, 1800);
+}
+
+function errorPart(error, depth = 0) {
+    if (error === null || error === undefined) return '';
+    if (depth > 4) return '';
+    if (typeof error === 'string') return error;
+    if (typeof error === 'object') {
+        const parts = [];
+        for (const key of ['status', 'statusText', 'code', 'type', 'message', 'error', 'detail', 'body']) {
+            if (error[key] !== undefined && error[key] !== null) {
+                const value = errorPart(error[key], depth + 1);
+                if (value) parts.push(key === 'message' ? value : `${key}: ${value}`);
+            }
+        }
+        return parts.join('; ');
+    }
+    return String(error);
+}
+
+// Connection Manager intentionally wraps provider errors in `cause`.
+// Keep the diagnostic useful without exposing API keys or proxy passwords.
+export function describeApiError(error) {
+    const parts = [];
+    const seen = new Set();
+    let current = error;
+    while (current && !seen.has(current) && parts.length < 5) {
+        seen.add(current);
+        const part = redactDiagnostic(errorPart(current));
+        if (part && !parts.includes(part)) parts.push(part);
+        current = current.cause;
+    }
+    return parts.join(' → ') || 'Неизвестная ошибка API';
 }
 
 export async function requestInterview(context, profileId, request, signal) {
@@ -144,21 +204,79 @@ export async function requestInterview(context, profileId, request, signal) {
         }
         const profiles = context.extensionSettings.connectionManager?.profiles || [];
         if (!profiles.some(p => p.id === profileId)) throw new Error('Профиль подключения удалён. Выберите другой профиль.');
-        const response = await service.sendRequest(profileId, request.messages, request.maxTokens, {
-            stream: false, extractData: true, includePreset: true, signal,
-        });
+        let response;
+        try {
+            response = await service.sendRequest(profileId, request.messages, request.maxTokens, {
+                stream: false, extractData: true, includePreset: true, signal,
+            });
+        } catch (error) {
+            throw new Error(`Профильное подключение: ${describeApiError(error)}`, { cause: error });
+        }
         text = response?.content;
     } else {
         if (typeof context.generateRaw !== 'function') throw new Error('API generateRaw недоступен. Обновите SillyTavern.');
         // Raw generation uses only our prompt and never appends messages to the story chat.
-        text = await context.generateRaw({
-            prompt: request.messages.slice(1), systemPrompt: request.messages[0].content,
-            responseLength: request.maxTokens, trimNames: false,
-        });
+        try {
+            text = await context.generateRaw({
+                prompt: request.messages.slice(1), systemPrompt: request.messages[0].content,
+                responseLength: request.maxTokens, trimNames: false,
+            });
+        } catch (error) {
+            throw new Error(`Основное подключение: ${describeApiError(error)}`, { cause: error });
+        }
     }
     if (signal?.aborted) throw new Error('Генерация отменена.');
     if (typeof text !== 'string' || !text.trim()) throw new Error('Модель вернула пустой ответ.');
     return text.trim();
+}
+
+function chunkText(chunk) {
+    if (typeof chunk === 'string') return chunk;
+    return chunk?.text ?? chunk?.content ?? chunk?.message?.content ?? '';
+}
+
+// Yields partial text from the same provider/profile used for the interview.
+export async function* streamInterview(context, profileId, request, signal, mainStream = null) {
+    if (signal?.aborted) throw new Error('Генерация отменена.');
+    let response;
+    try {
+        if (profileId) {
+            const service = context.ConnectionManagerRequestService;
+            if (!service?.sendRequest) throw new Error('Обновите SillyTavern: API потоковой генерации недоступен.');
+            if (context.extensionSettings.disabledExtensions?.includes('connection-manager')) throw new Error('Включите Connection Manager.');
+            const profiles = context.extensionSettings.connectionManager?.profiles || [];
+            if (!profiles.some(p => p.id === profileId)) throw new Error('Профиль подключения удалён. Выберите другой профиль.');
+            response = await service.sendRequest(profileId, request.messages, request.maxTokens, {
+                stream: true, extractData: true, includePreset: true, signal,
+            });
+        } else {
+            // Optional adapter uses the host's payload builder. Older/other APIs
+            // keep their original raw request, not a guessed Chat Completion payload.
+            response = mainStream ? await mainStream(context, request, signal) : null;
+            if (response === null) {
+                const text = await requestInterview(context, '', request, signal);
+                yield text;
+                return;
+            }
+        }
+    } catch (error) {
+        throw new Error(`API: ${describeApiError(error)}`, { cause: error });
+    }
+
+    const iterable = typeof response === 'function' ? response() : response;
+    if (iterable && typeof iterable[Symbol.asyncIterator] === 'function') {
+        for await (const chunk of iterable) {
+            if (signal?.aborted) throw new Error('Генерация отменена.');
+            const text = chunkText(chunk);
+            if (text) yield text;
+        }
+        if (signal?.aborted) throw new Error('Генерация отменена.');
+        return;
+    }
+    if (signal?.aborted) throw new Error('Генерация отменена.');
+    const text = chunkText(iterable);
+    if (text) yield text;
+    else throw new Error('Провайдер не вернул поток генерации.');
 }
 
 export class StaleInterviewError extends Error {
@@ -167,13 +285,18 @@ export class StaleInterviewError extends Error {
 
 // Commit a complete turn only after success; errors keep the question available for retry.
 export async function generateTurn(session, question, generate, isCurrent) {
-    const request = buildRequest(session, question);
-    const answer = await generate(request);
-    if (!isCurrent()) throw new StaleInterviewError();
-    const timestamp = new Date().toISOString();
-    session.messages.push(
-        { role: 'user', content: question.trim(), participants: request.participants, timestamp },
-        { role: 'assistant', content: answer, participants: request.participants, timestamp },
-    );
-    return answer;
+    const turn = beginTurn(session, question);
+    let answer;
+    try {
+        answer = await generate(turn.request);
+    } catch (error) {
+        discardTurn(session, turn);
+        throw error;
+    }
+    if (!isCurrent()) {
+        discardTurn(session, turn);
+        throw new StaleInterviewError();
+    }
+    try { return finishTurn(turn, answer); }
+    catch (error) { discardTurn(session, turn); throw error; }
 }

@@ -140,6 +140,9 @@ dialog.bts-dialog-fallback[open] {
 }
 
 .bts-bubble {
+    width: fit-content;
+    max-width: 90%;
+    box-sizing: border-box;
     margin-bottom: 12px;
     padding: 10px;
     border-radius: 8px;
@@ -148,8 +151,12 @@ dialog.bts-dialog-fallback[open] {
 }
 
 .bts-user {
+    margin-left: auto;
     background: rgb(110 140 220 / 12%);
 }
+
+.bts-assistant { margin-right: auto; }
+.bts-dialog [hidden] { display: none !important; }
 
 .bts-bubble small {
     display: block;
@@ -165,6 +172,18 @@ dialog.bts-dialog-fallback[open] {
 
 .bts-message-text em {
     color: var(--SmartThemeEmColor, #bbb);
+}
+
+.bts-typing {
+    display: block;
+    opacity: 0.75;
+    font-style: italic;
+}
+
+.bts-error {
+    display: block;
+    color: var(--crimson, #ff7777);
+    white-space: pre-wrap;
 }
 
 .bts-quick-questions {

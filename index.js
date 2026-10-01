@@ -1,8 +1,9 @@
 import { getContext } from '../../../extensions.js';
+import { requestMainStream } from './main-stream.mjs';
 import {
     MODULE_NAME, QUICK_QUESTIONS, createId, normalizeSettings, createSession,
-    getStore, participantFromCard, requestInterview, generateTurn, StaleInterviewError,
-    collectSceneParticipants, mergeParticipants, buildDetectionRequest, parseDetectedParticipants,
+    getStore, participantFromCard, requestInterview, beginTurn, finishTurn, discardTurn, streamInterview, StaleInterviewError,
+    collectSceneParticipants, mergeParticipants, buildDetectionRequest, parseDetectedParticipants, describeApiError,
 } from './interview-core.mjs';
 
 let settings;
@@ -26,8 +27,9 @@ function button(text, onClick, className = '') {
 }
 
 function reportError(error) {
-    console.error('[Behind the Scene]', error);
-    toastr.error(error.message || String(error), 'Behind the Scene');
+    const details = describeApiError(error);
+    console.error('[Behind the Scene]', { message: details });
+    toastr.error(details, 'Behind the Scene', { escapeHtml: true });
 }
 
 function chatKey(context = getContext()) {
@@ -72,6 +74,13 @@ function closeInterview() {
     const view = activeWindow;
     activeWindow = null;
     view.controller?.abort();
+    if (view.turn?.assistant.pending) {
+        view.turn.assistant.pending = false;
+        view.turn.assistant.failed = true;
+        view.turn.user.failed = true;
+        view.turn.assistant.error = 'Окно закрыто. Ответ прерван.';
+        if (sameChat(view.snapshot)) void persist(view.snapshot).catch(reportError);
+    }
     view.viewportCleanup?.();
     view.backdrop?.remove();
     document.removeEventListener('keydown', view.keyHandler);
@@ -88,8 +97,11 @@ function appendContent(node, text) {
     }
 }
 
-function renderMessages(view) {
+function renderMessages(view, forceScroll = true) {
+    const scrollTop = view.log.scrollTop;
+    const follow = forceScroll || view.log.scrollHeight - scrollTop - view.log.clientHeight < 80;
     view.log.replaceChildren();
+    view.messageNodes = new Map();
     if (!view.session.messages.length) view.log.append(element('p', 'bts-muted', 'Задайте первый вопрос. Основной сюжетный чат останется без изменений.'));
     for (const message of view.session.messages) {
         const bubble = element('article', `bts-bubble bts-${message.role}`);
@@ -98,9 +110,32 @@ function renderMessages(view) {
         const content = element('div', 'bts-message-text');
         appendContent(content, message.content);
         bubble.append(content);
+        view.messageNodes.set(message, content);
+        if (message.pending) bubble.append(element('small', 'bts-typing', message.content ? 'Печатает…' : 'Ожидание первых слов…'));
+        if (message.error) bubble.append(element('small', 'bts-error', message.error));
+        if (message.role === 'assistant' && message.failed && !view.busy) {
+            const index = view.session.messages.indexOf(message);
+            const user = view.session.messages[index - 1];
+            if (user?.role === 'user') bubble.append(button('Повторить вопрос', () => {
+                if (view.busy || requestInFlight) return;
+                view.input.value = user.content;
+                discardTurn(view.session, { user, assistant: message });
+                void sendQuestion(view);
+            }));
+        }
         view.log.append(bubble);
     }
-    view.log.scrollTop = view.log.scrollHeight;
+    view.log.scrollTop = follow ? view.log.scrollHeight : scrollTop;
+}
+
+function updateStreamBubble(view, message) {
+    const follow = view.log.scrollHeight - view.log.scrollTop - view.log.clientHeight < 80;
+    const content = view.messageNodes.get(message);
+    if (!content) return;
+    // Preserve the bubble and scroll position rather than rebuilding the transcript per token.
+    content.replaceChildren();
+    appendContent(content, message.content);
+    if (follow) view.log.scrollTop = view.log.scrollHeight;
 }
 
 function remember(view) {
@@ -163,6 +198,8 @@ async function detectParticipants(view) {
     view.controls.disabled = true;
     view.send.disabled = true;
     view.controller = new AbortController();
+    view.stop.hidden = false;
+    view.stop.disabled = false;
     view.detectionStatus.textContent = 'Ищу участников и NPC в тексте сцены…';
     try {
         const text = await requestInterview(getContext(), view.session.profileId, buildDetectionRequest(view.session), view.controller.signal);
@@ -173,14 +210,17 @@ async function detectParticipants(view) {
         view.detectionStatus.textContent = 'Участники найдены. Проверьте галочки: модель может ошибаться.';
     } catch (error) {
         if (activeWindow === view && sameChat(view.snapshot)) {
-            view.detectionStatus.textContent = `Не удалось найти NPC: ${error.message} Можно повторить или добавить вручную.`;
-            console.warn('[Behind the Scene] Participant detection:', error);
+            view.detectionStatus.textContent = view.controller.signal.aborted
+                ? 'Поиск NPC остановлен. Можно задать вопрос выбранным участникам.'
+                : `Не удалось найти NPC: ${describeApiError(error)} Можно повторить или добавить вручную.`;
+            console.warn('[Behind the Scene] Participant detection:', describeApiError(error));
         }
     } finally {
         view.busy = false;
         requestInFlight = false;
         view.controls.disabled = false;
         view.send.disabled = false;
+        view.stop.hidden = true;
     }
 }
 
@@ -252,26 +292,45 @@ async function sendQuestion(view) {
     const question = view.input.value.trim();
     if (!question) return view.input.focus();
     if (!view.session.participants.some(p => p.selected)) return toastr.warning('Выберите хотя бы одного участника.');
+    const turn = beginTurn(view.session, question);
+    view.turn = turn;
     view.busy = true;
     requestInFlight = true;
     view.controls.disabled = true;
     view.input.disabled = true;
     view.send.disabled = true;
     view.controller = new AbortController();
-    view.status.textContent = 'Генерация ответа…';
+    view.stop.hidden = false;
+    view.stop.disabled = false;
+    view.input.value = '';
+    view.status.textContent = 'Ожидание ответа модели…';
+    renderMessages(view);
+    void persist(view.snapshot).catch(reportError);
     try {
-        await generateTurn(view.session, question,
-            request => requestInterview(getContext(), view.session.profileId, request, view.controller.signal),
-            () => activeWindow === view && sameChat(view.snapshot));
-        view.input.value = '';
+        let answer = '';
+        for await (const text of streamInterview(getContext(), view.session.profileId, turn.request, view.controller.signal, requestMainStream)) {
+            if (activeWindow !== view || !sameChat(view.snapshot)) throw new StaleInterviewError();
+            // ST yields cumulative snapshots, not token deltas.
+            answer = text;
+            turn.assistant.content = text;
+            view.status.textContent = 'Получаем ответ…';
+            updateStreamBubble(view, turn.assistant);
+        }
+        if (activeWindow !== view || !sameChat(view.snapshot)) throw new StaleInterviewError();
+        finishTurn(turn, answer);
         renderMessages(view);
         await persist(view.snapshot);
         renderHistory();
         view.status.textContent = 'Ответ готов.';
     } catch (error) {
+        turn.user.failed = true;
+        turn.assistant.pending = false;
+        turn.assistant.failed = true;
+        turn.assistant.error = view.controller.signal.aborted ? 'Генерация остановлена.' : describeApiError(error);
         if (activeWindow === view && sameChat(view.snapshot) && !(error instanceof StaleInterviewError)) {
-            view.status.textContent = `Не удалось получить ответ: ${error.message}. Вопрос можно отправить повторно.`;
-            reportError(error);
+            view.status.textContent = `Не удалось получить ответ: ${describeApiError(error)}. Вопрос можно отправить повторно.`;
+            if (!view.controller.signal.aborted) reportError(error);
+            await persist(view.snapshot).catch(reportError);
         }
     } finally {
         view.busy = false;
@@ -279,13 +338,23 @@ async function sendQuestion(view) {
         view.controls.disabled = false;
         view.input.disabled = false;
         view.send.disabled = false;
-        if (activeWindow === view) view.input.focus();
+        view.stop.hidden = true;
+        view.turn = null;
+        if (activeWindow === view) { renderMessages(view, false); view.input.focus(); }
     }
 }
 
 function openInterview(session) {
     console.info('[Behind the Scene] Opening mini-chat', { sessionId: session.id, chat: chatKey() });
     closeInterview();
+    // A page reload cannot resume a saved network request.
+    session.messages.forEach((message, index) => {
+        if (!message.pending) return;
+        message.pending = false;
+        message.failed = true;
+        message.error = 'Предыдущая генерация была прервана.';
+        if (session.messages[index - 1]?.role === 'user') session.messages[index - 1].failed = true;
+    });
     const dialog = element('dialog', 'bts-dialog');
     dialog.setAttribute('aria-labelledby', 'bts-dialog-title');
     const header = element('header', 'bts-dialog-header');
@@ -398,9 +467,15 @@ function openInterview(session) {
         }
     });
     view.send = button('Спросить', () => void sendQuestion(view));
+    view.stop = button('Остановить', () => {
+        view.controller?.abort();
+        view.stop.disabled = true;
+        view.status.textContent = 'Останавливаем запрос… Для старого основного API нужно дождаться его завершения.';
+    });
+    view.stop.hidden = true;
     view.status = element('div', 'bts-status', 'Enter — отправить, Shift+Enter — новая строка.');
     view.status.setAttribute('role', 'status');
-    conversation.append(view.log, quick, view.input, view.send, view.status);
+    conversation.append(view.log, quick, view.input, view.send, view.stop, view.status);
     body.append(sidebar, conversation);
     dialog.append(header, body);
     dialog.addEventListener('cancel', event => { event.preventDefault(); closeInterview(); });
@@ -536,7 +611,7 @@ jQuery(() => {
         if (chatNode && typeof MutationObserver !== 'undefined') {
             new MutationObserver(syncButtons).observe(chatNode, { childList: true, subtree: true });
         }
-        console.log('[Behind the Scene] Mini-chat v2.1.0 loaded');
+        console.log('[Behind the Scene] Mini-chat v2.2.0 loaded');
     } catch (error) { reportError(error); }
 });
 
