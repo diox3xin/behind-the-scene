@@ -4,7 +4,7 @@ const MODULE_NAME = 'behind-the-scene';
     'use strict';
 
     const extensionName = MODULE_NAME;
-    const extensionFolderPath = `scripts/extensions/${extensionName}`;
+    const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
 
     let interviewHistory = [];
 
@@ -16,12 +16,17 @@ const MODULE_NAME = 'behind-the-scene';
     };
 
     function loadSettings() {
+        if (typeof extension_settings === 'undefined') {
+            console.error('[Behind the Scene] extension_settings is not available yet');
+            return;
+        }
+        
         extension_settings[extensionName] = extension_settings[extensionName] || {};
         if (Object.keys(extension_settings[extensionName]).length === 0) {
             Object.assign(extension_settings[extensionName], defaultSettings);
         }
         
-        if (chat_metadata[extensionName]) {
+        if (typeof chat_metadata !== 'undefined' && chat_metadata[extensionName]) {
             interviewHistory = chat_metadata[extensionName].history || [];
         }
     }
@@ -243,14 +248,29 @@ ${characterName} (как актёр): `;
     }
 
     jQuery(async () => {
-        loadSettings();
-        createUI();
+        // Wait for SillyTavern to initialize
+        const waitForGlobals = setInterval(() => {
+            if (typeof extension_settings !== 'undefined' && 
+                typeof chat_metadata !== 'undefined' && 
+                typeof getContext !== 'undefined') {
+                clearInterval(waitForGlobals);
+                
+                loadSettings();
+                createUI();
+                
+                if (extension_settings[extensionName].enabled) {
+                    addInterviewButtons();
+                }
+                
+                console.log('[Behind the Scene] Extension loaded successfully');
+            }
+        }, 100);
         
-        if (extension_settings[extensionName].enabled) {
-            addInterviewButtons();
-        }
-        
-        console.log('Behind the Scenes extension loaded');
+        // Timeout after 10 seconds
+        setTimeout(() => {
+            clearInterval(waitForGlobals);
+            console.error('[Behind the Scene] Failed to initialize - SillyTavern globals not available');
+        }, 10000);
     });
 })();
 
