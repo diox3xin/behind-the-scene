@@ -1,280 +1,404 @@
+import { getContext } from '../../../extensions.js';
 import {
-    extension_settings,
-    getContext,
-} from '../../../extensions.js';
+    MODULE_NAME, QUICK_QUESTIONS, createId, normalizeSettings, createSession,
+    getStore, participantFromCard, requestInterview, generateTurn, StaleInterviewError,
+} from './interview-core.mjs';
 
-import {
-    chat_metadata,
-    saveSettingsDebounced,
-    generateQuietPrompt,
-    callPopup,
-} from '../../../../script.js';
+let settings;
+let activeWindow = null;
+let chatEpoch = 0;
+let requestInFlight = false;
+let mainGenerating = false;
 
-const MODULE_NAME = 'behind-the-scene';
+function element(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+}
 
-(function() {
-    'use strict';
+function button(text, onClick, className = '') {
+    const node = element('button', `menu_button ${className}`, text);
+    node.type = 'button';
+    node.addEventListener('click', onClick);
+    return node;
+}
 
-    const extensionName = MODULE_NAME;
-    const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
+function reportError(error) {
+    console.error('[Behind the Scene]', error);
+    toastr.error(error.message || String(error), 'Behind the Scene');
+}
 
-    let interviewHistory = [];
+function hasChat(context = getContext()) {
+    return context.chatId !== undefined && context.chatId !== null && context.chatId !== '';
+}
 
-    const defaultSettings = {
-        enabled: true,
-        interviewStyle: 'casual',
-        includeContext: true,
-        maxInterviews: 50
-    };
+function captureChat() {
+    const context = getContext();
+    return { metadata: context.chatMetadata, id: context.chatId, character: context.characterId, group: context.groupId, epoch: chatEpoch };
+}
 
-    function loadSettings() {
-        if (typeof extension_settings === 'undefined') {
-            console.error('[Behind the Scene] extension_settings is not available yet');
-            return;
-        }
-        
-        extension_settings[extensionName] = extension_settings[extensionName] || {};
-        if (Object.keys(extension_settings[extensionName]).length === 0) {
-            Object.assign(extension_settings[extensionName], defaultSettings);
-        }
-        
-        if (typeof chat_metadata !== 'undefined' && chat_metadata[extensionName]) {
-            interviewHistory = chat_metadata[extensionName].history || [];
-        }
+function sameChat(snapshot) {
+    const context = getContext();
+    return snapshot.epoch === chatEpoch && snapshot.metadata === context.chatMetadata
+        && snapshot.id === context.chatId && snapshot.character === context.characterId && snapshot.group === context.groupId;
+}
+
+async function persist(snapshot = captureChat()) {
+    if (!sameChat(snapshot) || !hasChat()) return;
+    await getContext().saveMetadata();
+}
+
+function saveSettings() {
+    getContext().extensionSettings[MODULE_NAME] = settings;
+    getContext().saveSettingsDebounced();
+}
+
+function closeInterview() {
+    if (!activeWindow) return;
+    const view = activeWindow;
+    activeWindow = null;
+    view.controller?.abort();
+    view.dialog.close();
+    view.dialog.remove();
+}
+
+// Only *emphasis* is interpreted. HTML and model-generated scripts remain text.
+function appendContent(node, text) {
+    for (const part of String(text).split(/(\*[^*\n]+\*)/g)) {
+        if (part.startsWith('*') && part.endsWith('*') && part.length > 2) node.append(element('em', '', part.slice(1, -1)));
+        else node.append(document.createTextNode(part));
     }
+}
 
-    function saveSettings() {
-        saveSettingsDebounced();
-        chat_metadata[extensionName] = chat_metadata[extensionName] || {};
-        chat_metadata[extensionName].history = interviewHistory;
+function renderMessages(view) {
+    view.log.replaceChildren();
+    if (!view.session.messages.length) view.log.append(element('p', 'bts-muted', 'Задайте первый вопрос. Основной сюжетный чат останется без изменений.'));
+    for (const message of view.session.messages) {
+        const bubble = element('article', `bts-bubble bts-${message.role}`);
+        bubble.append(element('strong', '', message.role === 'user' ? 'Вы — интервьюер' : 'За кулисами'));
+        if (message.participants?.length) bubble.append(element('small', 'bts-muted', `Участники: ${message.participants.join(', ')}`));
+        const content = element('div', 'bts-message-text');
+        appendContent(content, message.content);
+        bubble.append(content);
+        view.log.append(bubble);
     }
+    view.log.scrollTop = view.log.scrollHeight;
+}
 
-    async function generateInterview(messageIndex) {
-        const context = getContext();
-        
-        if (!context.chat || context.chat.length === 0) {
-            toastr.warning('Нет сообщений для интервью');
-            return;
+function remember(view) {
+    if (!sameChat(view.snapshot)) return;
+    void persist(view.snapshot).catch(reportError);
+    renderHistory();
+}
+
+function renderParticipants(view) {
+    view.participants.replaceChildren();
+    if (!view.session.participants.length) view.participants.append(element('p', 'bts-muted', 'Добавьте персонажа из карточек или NPC вручную.'));
+    for (const participant of view.session.participants) {
+        const row = element('div', 'bts-participant');
+        const label = element('label', 'checkbox_label');
+        const check = element('input');
+        check.type = 'checkbox';
+        check.checked = participant.selected;
+        check.addEventListener('change', () => { participant.selected = check.checked; remember(view); });
+        label.append(check, document.createTextNode(participant.name));
+        label.title = participant.description || 'Описание не задано';
+        const remove = button('×', () => {
+            view.session.participants = view.session.participants.filter(p => p.id !== participant.id);
+            renderParticipants(view);
+            remember(view);
+        });
+        remove.setAttribute('aria-label', `Убрать ${participant.name}`);
+        row.append(label, remove);
+        view.participants.append(row);
+    }
+}
+
+function fillProfiles(select, value) {
+    select.replaceChildren(new Option('Основное подключение SillyTavern', ''));
+    const context = getContext();
+    for (const profile of context.extensionSettings.connectionManager?.profiles || []) {
+        const option = new Option(`${profile.name || profile.id}${profile.proxy ? ` · прокси: ${profile.proxy}` : ''}`, profile.id);
+        option.disabled = !context.ConnectionManagerRequestService?.sendRequest
+            || context.extensionSettings.disabledExtensions?.includes('connection-manager');
+        select.add(option);
+    }
+    if (value && !Array.from(select.options).some(o => o.value === value)) select.add(new Option('Профиль удалён — выберите другой', value));
+    select.value = value;
+}
+
+function labeled(text, control) {
+    const label = element('label', 'bts-field');
+    label.append(element('span', '', text), control);
+    return label;
+}
+
+async function sendQuestion(view) {
+    if (view.busy || requestInFlight) return toastr.warning('Дождитесь завершения текущего запроса интервью.');
+    if (!settings.enabled || !sameChat(view.snapshot)) return;
+    if (mainGenerating) return toastr.warning('Сначала дождитесь ответа в основном чате.');
+    const question = view.input.value.trim();
+    if (!question) return view.input.focus();
+    if (!view.session.participants.some(p => p.selected)) return toastr.warning('Выберите хотя бы одного участника.');
+    view.busy = true;
+    requestInFlight = true;
+    view.controls.disabled = true;
+    view.input.disabled = true;
+    view.send.disabled = true;
+    view.controller = new AbortController();
+    view.status.textContent = 'Генерация ответа…';
+    try {
+        await generateTurn(view.session, question,
+            request => requestInterview(getContext(), view.session.profileId, request, view.controller.signal),
+            () => activeWindow === view && sameChat(view.snapshot));
+        view.input.value = '';
+        renderMessages(view);
+        await persist(view.snapshot);
+        renderHistory();
+        view.status.textContent = 'Ответ готов.';
+    } catch (error) {
+        if (activeWindow === view && sameChat(view.snapshot) && !(error instanceof StaleInterviewError)) {
+            view.status.textContent = `Не удалось получить ответ: ${error.message}. Вопрос можно отправить повторно.`;
+            reportError(error);
         }
-        
-        const message = context.chat[messageIndex];
-        if (!message) {
-            toastr.warning('Сообщение не найдено');
-            return;
-        }
-        
-        const characterName = message.name || 'Персонаж';
-        const sceneText = message.mes;
-        const contextStart = Math.max(0, messageIndex - 2);
-        const contextEnd = Math.min(context.chat.length, messageIndex + 3);
-        const sceneContext = context.chat.slice(contextStart, contextEnd)
-            .map(msg => `${msg.name}: ${msg.mes}`).join('\n\n');
-        
-        const interviewPrompt = `[Это закулисное интервью. ${characterName} — актёр/актриса, который(ая) только что сыграл(а) сцену в фильме/сериале. Веди себя как актёр, обсуждающий свою роль, эмоции, трудности съёмки и взаимодействие с партнёрами по съёмочной площадке.]
+    } finally {
+        view.busy = false;
+        requestInFlight = false;
+        view.controls.disabled = false;
+        view.input.disabled = false;
+        view.send.disabled = false;
+        if (activeWindow === view) view.input.focus();
+    }
+}
 
-Интервьюер: Спасибо, что нашли время! Расскажите о сцене, которую вы только что сняли.
+function openInterview(session) {
+    closeInterview();
+    const dialog = element('dialog', 'bts-dialog');
+    dialog.setAttribute('aria-labelledby', 'bts-dialog-title');
+    const header = element('header', 'bts-dialog-header');
+    const title = element('h3', '', '🎬 За кулисами');
+    title.id = 'bts-dialog-title';
+    header.append(title, button('Закрыть', closeInterview));
+    const body = element('div', 'bts-dialog-body');
+    const sidebar = element('aside', 'bts-sidebar');
+    const controls = element('fieldset', 'bts-controls');
+    const view = { session, dialog, controls, snapshot: captureChat(), busy: false };
+    activeWindow = view;
+    const scene = element('details', 'bts-scene');
+    scene.append(element('summary', '', `Сцена: ${session.sceneName}`), element('div', 'bts-message-text', session.scene));
+    controls.append(scene, element('h4', '', 'Кого спросить?'));
+    view.participants = element('div', 'bts-participants');
+    controls.append(view.participants);
+    renderParticipants(view);
 
-Сцена:
-"${sceneText}"
-
-${extension_settings[extensionName].includeContext ? `\nКонтекст сцены:\n${sceneContext}` : ''}
-
-${characterName} (как актёр): `;
-
-        const loadingToast = toastr.info('Генерация интервью...', '', { timeOut: 0 });
-        
+    const cardSelect = element('select', 'text_pole');
+    cardSelect.add(new Option('Выберите карточку…', ''));
+    Object.entries(getContext().characters || {}).forEach(([id, card]) => {
+        if (card) cardSelect.add(new Option(card.name || `Персонаж ${id}`, id));
+    });
+    const addCard = button('Добавить персонажа', async () => {
+        if (!cardSelect.value) return;
+        const id = cardSelect.value;
+        addCard.disabled = true;
         try {
-            const interview = await generateQuietPrompt(interviewPrompt, false, false);
-            const interviewData = {
-                id: Date.now(),
-                timestamp: new Date().toISOString(),
-                character: characterName,
-                messageIndex: messageIndex,
-                scene: sceneText,
-                interview: interview,
-                context: extension_settings[extensionName].includeContext ? sceneContext : null
-            };
-            
-            interviewHistory.unshift(interviewData);
-            if (interviewHistory.length > extension_settings[extensionName].maxInterviews) {
-                interviewHistory = interviewHistory.slice(0, extension_settings[extensionName].maxInterviews);
-            }
-            
-            saveSettings();
-            toastr.clear(loadingToast);
-            toastr.success('Интервью сгенерировано!');
-            showInterviewPopup(interviewData);
-            updateInterviewList();
-        } catch (error) {
-            toastr.clear(loadingToast);
-            toastr.error('Ошибка генерации интервью: ' + error.message);
-            console.error('Interview generation error:', error);
+            await getContext().unshallowCharacter?.(id);
+            if (activeWindow !== view || !sameChat(view.snapshot)) return;
+            const card = getContext().characters[id];
+            if (!card) throw new Error('Карточка не найдена.');
+            if (session.participants.some(p => p.avatar && p.avatar === card.avatar)) return toastr.info('Персонаж уже добавлен.');
+            session.participants.push(participantFromCard(card));
+            renderParticipants(view);
+            remember(view);
+        } catch (error) { reportError(error); }
+        finally { addCard.disabled = false; }
+    });
+    controls.append(labeled('Из карточек SillyTavern', cardSelect), addCard);
+    const npcDetails = element('details');
+    npcDetails.append(element('summary', '', 'Добавить NPC вручную'));
+    const npcName = element('input', 'text_pole');
+    npcName.maxLength = 100;
+    const npcDescription = element('textarea', 'text_pole');
+    npcDescription.rows = 3;
+    npcDescription.maxLength = 6000;
+    npcDetails.append(labeled('Имя NPC', npcName), labeled('Характер и роль (необязательно)', npcDescription), button('Добавить NPC', () => {
+        if (!npcName.value.trim()) return npcName.focus();
+        session.participants.push({ id: createId(), name: npcName.value.trim(), description: npcDescription.value.trim(), selected: true });
+        npcName.value = '';
+        npcDescription.value = '';
+        renderParticipants(view);
+        remember(view);
+    }));
+    controls.append(npcDetails);
+    const profile = element('select', 'text_pole');
+    fillProfiles(profile, session.profileId);
+    profile.addEventListener('change', () => {
+        session.profileId = profile.value;
+        settings.profileId = profile.value;
+        saveSettings();
+        remember(view);
+    });
+    controls.append(labeled('Подключение для интервью', profile), button('Обновить список подключений', () => fillProfiles(profile, session.profileId)),
+        element('small', 'bts-muted', 'Отдельный API/прокси настройте в Connection Manager. Основное подключение не переключается. Ключи здесь не хранятся.'));
+    const length = element('input', 'text_pole');
+    length.type = 'number';
+    length.min = '80';
+    length.max = '800';
+    length.step = '20';
+    length.value = session.responseLength;
+    length.addEventListener('change', () => {
+        session.responseLength = normalizeSettings({ responseLength: length.value }).responseLength;
+        length.value = session.responseLength;
+        settings.responseLength = session.responseLength;
+        saveSettings();
+        remember(view);
+    });
+    controls.append(labeled('Лимит токенов на весь ответ', length));
+    const include = element('input');
+    include.type = 'checkbox';
+    include.checked = session.includeContext;
+    include.addEventListener('change', () => { session.includeContext = include.checked; remember(view); });
+    controls.append(labeled('Учитывать соседние сообщения сцены', include));
+    sidebar.append(controls);
+
+    const conversation = element('section', 'bts-conversation');
+    view.log = element('div', 'bts-chat-log');
+    view.log.setAttribute('role', 'log');
+    view.log.setAttribute('aria-label', 'История интервью');
+    const quick = element('div', 'bts-quick-questions');
+    QUICK_QUESTIONS.forEach(question => quick.append(button(question, () => {
+        if (view.busy) return;
+        view.input.value = question;
+        view.input.focus();
+    })));
+    view.input = element('textarea', 'text_pole bts-question');
+    view.input.rows = 3;
+    view.input.maxLength = 4000;
+    view.input.placeholder = 'Ваш вопрос…';
+    view.input.setAttribute('aria-label', 'Ваш вопрос участникам интервью');
+    view.input.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+            event.preventDefault();
+            void sendQuestion(view);
         }
-    }
+    });
+    view.send = button('Спросить', () => void sendQuestion(view));
+    view.status = element('div', 'bts-status', 'Enter — отправить, Shift+Enter — новая строка.');
+    view.status.setAttribute('role', 'status');
+    conversation.append(view.log, quick, view.input, view.send, view.status);
+    body.append(sidebar, conversation);
+    dialog.append(header, body);
+    dialog.addEventListener('cancel', event => { event.preventDefault(); closeInterview(); });
+    document.body.append(dialog);
+    renderMessages(view);
+    dialog.showModal();
+    view.input.focus();
+}
 
-    function showInterviewPopup(interviewData) {
-        const popup = `
-            <div class="bts-interview-popup">
-                <div class="bts-interview-header">
-                    <h3>🎬 Интервью: ${interviewData.character}</h3>
-                    <small>${new Date(interviewData.timestamp).toLocaleString('ru-RU')}</small>
-                </div>
-                <div class="bts-interview-scene">
-                    <h4>Сцена:</h4>
-                    <p>${interviewData.scene}</p>
-                </div>
-                <div class="bts-interview-content">
-                    <h4>Интервью:</h4>
-                    <p>${interviewData.interview}</p>
-                </div>
-            </div>
-        `;
-        callPopup(popup, 'text', '', { wide: true, large: true });
-    }
-
-    function updateInterviewList() {
-        const container = $('#bts-interview-list');
-        if (!container.length) return;
-        container.empty();
-        
-        if (interviewHistory.length === 0) {
-            container.append('<div class="bts-no-interviews">Интервью пока нет. Нажмите на кнопку 🎬 рядом с сообщением!</div>');
-            return;
+async function startInterview(messageIndex) {
+    if (!settings.enabled || !hasChat()) return;
+    const snapshot = captureChat();
+    try {
+        const context = getContext();
+        const session = createSession(context.chat, messageIndex, settings);
+        const cardId = Object.keys(context.characters || {}).find(id => context.characters[id]?.name === session.sceneName);
+        if (cardId !== undefined) {
+            await context.unshallowCharacter?.(cardId);
+            if (!sameChat(snapshot)) return;
+            session.participants.push(participantFromCard(getContext().characters[cardId]));
+        } else if (!context.chat[messageIndex].is_user && !context.chat[messageIndex].is_system) {
+            session.participants.push({ id: createId(), name: session.sceneName, description: '', selected: true });
         }
-        
-        interviewHistory.forEach(interview => {
-            const item = $(`
-                <div class="bts-interview-item" data-interview-id="${interview.id}">
-                    <div class="bts-interview-item-header">
-                        <strong>${interview.character}</strong>
-                        <small>${new Date(interview.timestamp).toLocaleString('ru-RU')}</small>
-                    </div>
-                    <div class="bts-interview-item-preview">
-                        ${interview.scene.substring(0, 100)}${interview.scene.length > 100 ? '...' : ''}
-                    </div>
-                    <button class="bts-view-btn menu_button" data-interview-id="${interview.id}">
-                        👁️ Посмотреть
-                    </button>
-                    <button class="bts-delete-btn menu_button" data-interview-id="${interview.id}">
-                        🗑️ Удалить
-                    </button>
-                </div>
-            `);
-            container.append(item);
-        });
-        
-        $('.bts-view-btn').on('click', function() {
-            const id = $(this).data('interview-id');
-            const interview = interviewHistory.find(i => i.id === id);
-            if (interview) showInterviewPopup(interview);
-        });
-        
-        $('.bts-delete-btn').on('click', function() {
-            const id = $(this).data('interview-id');
-            interviewHistory = interviewHistory.filter(i => i.id !== id);
-            saveSettings();
-            updateInterviewList();
-            toastr.success('Интервью удалено');
-        });
-    }
+        getStore(getContext().chatMetadata).sessions.unshift(session);
+        openInterview(session);
+        renderHistory();
+        await persist(snapshot);
+    } catch (error) { reportError(error); }
+}
 
-    function addInterviewButtons() {
-        $(document).on('mouseenter', '.mes', function() {
-            const mesBlock = $(this);
-            if (mesBlock.find('.bts-interview-btn').length > 0) return;
-            
-            const messageIndex = mesBlock.attr('mesid');
-            const btn = $(`
-                <div class="bts-interview-btn" title="Взять интервью о сцене" data-message-index="${messageIndex}">
-                    🎬
-                </div>
-            `);
-            
-            btn.on('click', function(e) {
-                e.stopPropagation();
-                const index = parseInt($(this).data('message-index'));
-                generateInterview(index);
-            });
-            
-            mesBlock.find('.mes_buttons').append(btn);
-        });
+function renderHistory() {
+    const list = document.getElementById('bts-interview-list');
+    if (!list) return;
+    list.replaceChildren();
+    if (!hasChat()) return list.append(element('p', 'bts-muted', 'Откройте чат, чтобы увидеть его интервью.'));
+    const store = getStore(getContext().chatMetadata);
+    if (!store.sessions.length) list.append(element('p', 'bts-muted', 'Нажмите 🎬 у сообщения сцены, чтобы начать интервью.'));
+    for (const session of store.sessions) {
+        const row = element('div', 'bts-history-item');
+        row.append(element('strong', '', session.sceneName), element('small', '', new Date(session.timestamp).toLocaleString('ru-RU')),
+            element('p', '', session.scene.slice(0, 100)));
+        const open = button('Открыть', () => openInterview(session));
+        open.disabled = !settings.enabled;
+        row.append(open, button('Удалить', () => {
+            if (!confirm('Удалить это интервью?')) return;
+            if (activeWindow?.session === session) closeInterview();
+            store.sessions = store.sessions.filter(item => item !== session);
+            void persist().catch(reportError);
+            renderHistory();
+        }));
+        list.append(row);
     }
+}
 
-    function createUI() {
-        const drawerContent = `
-            <div id="bts-panel">
-                <div class="inline-drawer">
-                    <div class="inline-drawer-toggle inline-drawer-header">
-                        <b>🎬 Behind the Scenes</b>
-                        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-                    </div>
-                    <div class="inline-drawer-content">
-                        <div class="bts-controls">
-                            <label class="checkbox_label">
-                                <input id="bts-enabled" type="checkbox" />
-                                <span>Включить расширение</span>
-                            </label>
-                            <label class="checkbox_label">
-                                <input id="bts-include-context" type="checkbox" />
-                                <span>Включать контекст сцены</span>
-                            </label>
-                        </div>
-                        <div class="bts-interview-section">
-                            <h3>История интервью</h3>
-                            <div id="bts-interview-list"></div>
-                        </div>
-                        <div class="bts-actions">
-                            <button id="bts-clear-history" class="menu_button">
-                                🗑️ Очистить историю
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        `;
-        
-        $('#extensions_settings2').append(drawerContent);
-        $('#bts-enabled').prop('checked', extension_settings[extensionName].enabled);
-        $('#bts-include-context').prop('checked', extension_settings[extensionName].includeContext);
-        
-        $('#bts-enabled').on('change', function() {
-            extension_settings[extensionName].enabled = $(this).prop('checked');
-            saveSettings();
-        });
-        
-        $('#bts-include-context').on('change', function() {
-            extension_settings[extensionName].includeContext = $(this).prop('checked');
-            saveSettings();
-        });
-        
-        $('#bts-clear-history').on('click', function() {
-            if (confirm('Удалить все интервью?')) {
-                interviewHistory = [];
-                saveSettings();
-                updateInterviewList();
-                toastr.success('История очищена');
-            }
-        });
-        
-        updateInterviewList();
-    }
+function syncButtons() {
+    document.querySelectorAll('.mes').forEach(message => {
+        const old = message.querySelector('.bts-interview-btn');
+        if (!settings.enabled) { old?.remove(); return; }
+        if (old) return;
+        const target = message.querySelector('.mes_buttons');
+        if (!target) return;
+        const action = button('🎬', event => {
+            event.stopPropagation();
+            void startInterview(Number(message.getAttribute('mesid')));
+        }, 'bts-interview-btn');
+        action.title = 'Открыть закулисный мини-чат';
+        action.setAttribute('aria-label', action.title);
+        target.append(action);
+    });
+}
+
+function createUI() {
+    const panel = element('div');
+    panel.id = 'bts-panel';
+    const drawer = element('details');
+    drawer.append(element('summary', '', '🎬 Behind the Scenes — мини-чат'));
+    const enabled = element('input');
+    enabled.type = 'checkbox';
+    enabled.checked = settings.enabled;
+    enabled.addEventListener('change', () => {
+        settings.enabled = enabled.checked;
+        saveSettings();
+        if (!settings.enabled) closeInterview();
+        syncButtons();
+        renderHistory();
+    });
+    drawer.append(labeled('Включить расширение', enabled));
+    const list = element('div');
+    list.id = 'bts-interview-list';
+    drawer.append(element('h4', '', 'Интервью текущего чата'), list);
+    panel.append(drawer);
+    const target = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
+    if (!target) throw new Error('Контейнер настроек расширений не найден.');
+    target.append(panel);
+    renderHistory();
+}
 
 jQuery(() => {
     try {
-        loadSettings();
+        const context = getContext();
+        settings = normalizeSettings(context.extensionSettings[MODULE_NAME]);
+        context.extensionSettings[MODULE_NAME] = settings;
         createUI();
-
-        if (extension_settings[extensionName].enabled) {
-            addInterviewButtons();
-        }
-
-        console.log('[Behind the Scene] Extension loaded successfully');
-    } catch (error) {
-        console.error('[Behind the Scene] Initialization failed:', error);
-    }
+        syncButtons();
+        const events = context.eventTypes || context.event_types;
+        const on = (name, handler) => { if (events?.[name]) context.eventSource.on(events[name], handler); };
+        on('CHAT_CHANGED', () => { chatEpoch++; closeInterview(); renderHistory(); syncButtons(); });
+        for (const name of ['CHARACTER_MESSAGE_RENDERED', 'USER_MESSAGE_RENDERED', 'MORE_MESSAGES_LOADED', 'MESSAGE_SWIPED']) on(name, syncButtons);
+        on('GENERATION_STARTED', () => { mainGenerating = true; });
+        on('GENERATION_ENDED', () => { mainGenerating = false; });
+        $(document).on('mouseenter.bts focusin.bts', '.mes', syncButtons);
+        console.log('[Behind the Scene] Mini-chat v2 loaded');
+    } catch (error) { reportError(error); }
 });
 
-})();
-
-// Export required for SillyTavern
 export { MODULE_NAME };
