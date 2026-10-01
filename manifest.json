@@ -1,12 +1,12 @@
 {
-    "display_name": "Behind the Scenes",
-    "loading_order": 100,
+    "display_name": "Behind the Scene",
+    "loading_order": 1000,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
     "author": "diox3xin",
     "version": "1.0.0",
-    "homePage": "https://github.com/diox3xin/behind-the-scene/",
+    "homePage": "https://github.com/diox3xin/behind-the-scene",
     "auto_update": true
 }
