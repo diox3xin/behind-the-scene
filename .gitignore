@@ -1,0 +1,13 @@
+# Behind the Scenes Extension
+
+node_modules/
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.env
+.env.local

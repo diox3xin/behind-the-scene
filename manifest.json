@@ -1,0 +1,12 @@
+{
+    "display_name": "Behind the Scenes",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "diox3",
+    "version": "1.0.0",
+    "homePage": "https://github.com/yourusername/sillytavern-behind-the-scenes",
+    "auto_update": false
+}
